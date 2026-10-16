@@ -19,6 +19,7 @@ Exit codes:
 
 import sys
 import json
+import math
 import argparse
 from pathlib import Path
 
@@ -215,6 +216,20 @@ def audit_quality(sheets: dict) -> dict:
 # Summary statistics
 # ---------------------------------------------------------------------------
 
+def _json_value(value):
+    """Return a value JSON can carry.
+
+    NaN and the infinities have no JSON representation (RFC 8259), and
+    `json.dumps`' `default=str` never fires for floats, so they used to leave a
+    bare `NaN` token in the `--json` output — a document strict parsers in Node,
+    Go and Rust reject, on exactly the sparse columns where a statistic is not
+    computable (the std of a single value, say). Those become null instead.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def compute_stats(sheets: dict) -> dict:
     """Compute descriptive statistics for numeric columns per sheet."""
     stats = {}
@@ -224,7 +239,10 @@ def compute_stats(sheets: dict) -> dict:
             stats[sheet_name] = {}
             continue
         desc = numeric_df.describe().round(4)
-        stats[sheet_name] = desc.to_dict()
+        stats[sheet_name] = {
+            column: {stat: _json_value(value) for stat, value in column_stats.items()}
+            for column, column_stats in desc.to_dict().items()
+        }
     return stats
 
 
