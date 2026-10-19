@@ -41,7 +41,10 @@ def strict_loads(text):
     return json.loads(text, parse_constant=reject_constant)
 
 
-@unittest.skipUnless(HAS_PANDAS, "xlsx_reader.py requires pandas")
+@unittest.skipUnless(
+    HAS_PANDAS and sys.version_info >= (3, 10),
+    "xlsx_reader.py needs pandas and Python >= 3.10 (PEP 604 annotations are evaluated at def time)",
+)
 class XlsxReaderJsonNanTests(unittest.TestCase):
     def run_tool(self, csv_text, *args):
         with tempfile.TemporaryDirectory() as tmp:
@@ -68,6 +71,19 @@ class XlsxReaderJsonNanTests(unittest.TestCase):
         self.assertIsNone(column["std"], "a std that cannot be computed is null, not NaN")
         self.assertEqual(column["count"], 1, "the computable statistics must stay")
         self.assertEqual(column["min"], 5)
+
+    def test_a_missing_cell_in_the_structure_preview_serializes_as_null(self):
+        # Any null in the first five rows of any column reaches
+        # structure.preview, which a sanitizer attached to compute_stats never
+        # covered — the more common shape of the same invalid document.
+        fixture = chr(10).join(["name,num", "alice,5", "bob,", "carol,7", ",9", ""])
+        result = self.run_tool(fixture, "--json")
+        self.assertNotIn("NaN", result.stdout, "the preview must not leak a NaN token")
+
+        document = strict_loads(result.stdout)
+        preview = document["structure"]["data"]["preview"]
+        self.assertIsNone(preview[1]["num"], "a missing numeric cell is null")
+        self.assertIsNone(preview[3]["name"], "a missing text cell is null too")
 
     def test_a_column_with_two_values_keeps_its_std(self):
         result = self.run_tool("num\n5\n7\n", "--json")

@@ -216,17 +216,24 @@ def audit_quality(sheets: dict) -> dict:
 # Summary statistics
 # ---------------------------------------------------------------------------
 
-def _json_value(value):
-    """Return a value JSON can carry.
+def _json_safe(value):
+    """Return a value JSON can carry, recursively.
 
-    NaN and the infinities have no JSON representation (RFC 8259), and
+    NaN and the infinities have no JSON representation (RFC 8259) and
     `json.dumps`' `default=str` never fires for floats, so they used to leave a
-    bare `NaN` token in the `--json` output — a document strict parsers in Node,
-    Go and Rust reject, on exactly the sparse columns where a statistic is not
-    computable (the std of a single value, say). Those become null instead.
+    bare `NaN` token in the `--json` document — from the statistics (the std of
+    a single value) and from the structure preview (any missing cell in the
+    first rows of any column). Sanitizing here, at the boundary every producer
+    passes through, covers both; the call site's `allow_nan=False` is the
+    tripwire that makes a future non-finite value fail loudly instead of
+    silently shipping an unparseable document.
     """
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
     return value
 
 
@@ -239,10 +246,7 @@ def compute_stats(sheets: dict) -> dict:
             stats[sheet_name] = {}
             continue
         desc = numeric_df.describe().round(4)
-        stats[sheet_name] = {
-            column: {stat: _json_value(value) for stat, value in column_stats.items()}
-            for column, column_stats in desc.to_dict().items()
-        }
+        stats[sheet_name] = desc.to_dict()
     return stats
 
 
@@ -370,7 +374,8 @@ def main() -> None:
             "stats": stats,
         }
         # Convert preview records to serializable form (handle non-JSON types)
-        print(json.dumps(output, indent=2, ensure_ascii=False, default=str))
+        print(json.dumps(_json_safe(output), indent=2, ensure_ascii=False,
+                         default=str, allow_nan=False))
     else:
         report = render_report(args.file, structure, quality, stats)
         print(report)
