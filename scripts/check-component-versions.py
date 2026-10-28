@@ -143,7 +143,7 @@ def check_generated_contracts_untracked(errors: list[str]) -> None:
                 ["git", "ls-files", "--error-unmatch", path],
                 cwd=ROOT,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 check=False,
             )
         except OSError:
@@ -151,6 +151,9 @@ def check_generated_contracts_untracked(errors: list[str]) -> None:
             return
         if result.returncode == 0:
             errors.append(f"{path}: generated component contract must not be tracked")
+        elif result.returncode != 1:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            errors.append(f"{path}: git ls-files failed (exit {result.returncode}): {detail}")
 
 
 def main() -> int:
