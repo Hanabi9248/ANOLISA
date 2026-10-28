@@ -16,7 +16,10 @@ from urllib.parse import unquote, urlsplit
 
 # Inline links and images: [text](target) / ![alt](target) — both follow the
 # same relative path resolution rules, so a single pattern covers them.
-LINK_RE = re.compile(r'!?\[[^\]]*\]\((<[^>\n]*>|[^)\s]+)(?:\s+"[^"]*")?\)')
+LINK_RE = re.compile(
+    r"""!?\[[^\]]*\]\((<[^>\n]*>|[^)\s]+)"""
+    r"""(?:\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\)))?\)"""
+)
 SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
 
