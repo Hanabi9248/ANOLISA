@@ -18,6 +18,7 @@ on:
       - '.github/docs-lint-exemptions.txt'
       - 'scripts/docs-link-check.py'
       - 'tests/test_docs_link_references.py'
+      - 'tests/test_docs_link_reference_review.py'
       - 'scripts/test_docs_link_check.py'
       - '.github/workflows/docs-lint.yml'
 
@@ -36,6 +37,9 @@ jobs:
 
       - name: Reference link CLI regressions
         run: python3 -m unittest discover -s tests -p 'test_docs_link_references.py'
+
+      - name: Reference review CLI regressions
+        run: python3 -m unittest discover -s tests -p 'test_docs_link_reference_review.py'
 
       - name: Relative link check
         run: |

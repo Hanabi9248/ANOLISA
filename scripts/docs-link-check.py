@@ -28,7 +28,9 @@ def normalize_reference_label(label: str) -> str:
     return " ".join(label.split()).casefold()
 
 
-def reference_prose(text: str, mask_inline: bool = True) -> str:
+def reference_prose(
+    text: str, mask_inline: bool = True, mask_comments: bool = True
+) -> str:
     """Mask code only for reference discovery; keep original character offsets."""
     lines = []
     fence = ""
@@ -65,7 +67,7 @@ def reference_prose(text: str, mask_inline: bool = True) -> str:
         if prose[cursor] == "\\":
             cursor += 2
             continue
-        if prose.startswith("<!--", cursor):
+        if mask_comments and prose.startswith("<!--", cursor):
             comment_end = prose.find("-->", cursor + 4)
             comment_end = len(prose) if comment_end < 0 else comment_end + 3
             for position in range(cursor, comment_end):
@@ -100,59 +102,98 @@ def reference_prose(text: str, mask_inline: bool = True) -> str:
 
 
 def reference_links(text: str) -> tuple[str, list[str]]:
-    """Resolve used top-level definitions; leave unsupported definitions unvalidated."""
-    prose = reference_prose(text, mask_inline=False)
+    """Resolve references using original labels and validated definition extents."""
+    prose = reference_prose(text, mask_inline=False, mask_comments=False)
+    visible = reference_prose(text)
     definition_start = re.compile(r"^ {0,3}\[([^\[\]\n]+)\]:[ \t]*(.*)$")
+    title = r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\))"""
     definition_value = re.compile(
-        r"""^(<[^>\n]*>|[^\s<>]+)"""
-        r"""(?:[ \t]+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\)))?[ \t]*$"""
+        r"^(<[^>\n]*>|[^\s<>]+)(?:[ \t]+(" + title + r"))?[ \t]*$"
+    )
+    title_value = re.compile(r"^[ \t]*" + title + r"[ \t]*$")
+    boundary = re.compile(
+        r"^ {0,3}(?:#{1,6}(?:[ \t]|$)|(?:\*[ \t]*){3,}$|"
+        r"(?:_[ \t]*){3,}$|(?:-[ \t]*){3,}$)"
     )
     definitions: dict[str, str | None] = {}
     uses = list(prose)
     inline_text = list(text)
-    offset = 0
     lines = prose.splitlines(keepends=True)
+    visible_lines = visible.splitlines(keepends=True)
     continuation_until = 0
     previous_definition = False
+    offset = 0
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
-        container = re.sub(r"^(?: {0,3}>[ \t]?)+", "", content)
-        container = re.sub(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)])[ \t]{1,4}", "", container)
-        complex_definition = (
-            definition_start.match(container) if container != content else None
-        )
-        if complex_definition:
-            definitions.setdefault(
-                normalize_reference_label(complex_definition[1]), None
+        if index < continuation_until:
+            valid = True
+        else:
+            container = re.sub(r"^(?: {0,3}>[ \t]?)+", "", content)
+            container = re.sub(
+                r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)])[ \t]{1,4}", "", container
             )
-        block_start = index == 0 or not lines[index - 1].strip() or previous_definition
-        match = (
-            definition_start.match(content)
-            if block_start and index >= continuation_until
-            else None
-        )
-        previous_definition = match is not None
-        if match:
-            label = normalize_reference_label(match[1])
-            value = definition_value.fullmatch(match[2])
-            if index + 1 < len(lines) and lines[index + 1].lstrip().startswith(
-                ('"', "'", "(")
-            ):
-                # Multiline title syntax is outside the bounded definition
-                # reader. Ignore that definition and its continuation instead
-                # of treating title examples or later duplicates as links.
-                value = None
-                continuation_until = index + 1
-                while (
-                    continuation_until < len(lines)
-                    and lines[continuation_until].strip()
+            complex_definition = container != content
+            setext_boundary = (
+                index >= 2
+                and bool(lines[index - 2].strip())
+                and boundary.match(lines[index - 2].rstrip("\r\n")) is None
+                and re.fullmatch(r" {0,3}=+[ \t]*", lines[index - 1].rstrip("\r\n"))
+                is not None
+            )
+            block_start = (
+                index == 0
+                or not lines[index - 1].strip()
+                or previous_definition
+                or setext_boundary
+                or boundary.match(lines[index - 1].rstrip("\r\n")) is not None
+            )
+            match = (
+                definition_start.match(container)
+                if block_start or complex_definition
+                else None
+            )
+            # Visibility excludes examples; validation and lookup retain the
+            # original source, including code spans/comments inside labels.
+            bracket = content.find("[")
+            if match and (bracket < 0 or visible_lines[index][bracket] != "["):
+                match = None
+            value = definition_value.fullmatch(match[2]) if match else None
+            end = index + 1
+            multiline_destination = False
+            if match and not match[2].strip() and end < len(lines):
+                value = definition_value.fullmatch(lines[end].strip())
+                if value:
+                    multiline_destination = True
+                    end += 1
+            valid = value is not None
+            if valid:
+                if (
+                    value[2] is None
+                    and end < len(lines)
+                    and lines[end].lstrip().startswith(('"', "'", "("))
                 ):
-                    continuation_until += 1
-            # Reserving unsupported first definitions prevents a later duplicate
-            # from introducing a false missing-target report.
-            if label and label not in definitions:
-                definitions[label] = value[1] if value else None
-        if match or complex_definition or index < continuation_until:
+                    # Only an actually terminated title belongs to this
+                    # definition. An incomplete candidate remains normal prose.
+                    for title_end in range(end + 1, len(lines) + 1):
+                        if not lines[title_end - 1].strip():
+                            break
+                        candidate = "".join(lines[end:title_end]).rstrip("\r\n")
+                        if title_value.fullmatch(candidate):
+                            end = title_end
+                            break
+                label = normalize_reference_label(match[1])
+                if label:
+                    # Container/multiline destinations retain the existing
+                    # conservative first-definition reservation.
+                    target = (
+                        None
+                        if complex_definition or multiline_destination
+                        else value[1]
+                    )
+                    definitions.setdefault(label, target)
+                continuation_until = end
+        previous_definition = valid
+        if valid:
             for position in range(offset, offset + len(line)):
                 if uses[position] not in "\r\n":
                     uses[position] = " "
@@ -162,12 +203,11 @@ def reference_links(text: str) -> tuple[str, list[str]]:
 
     text_for_uses = reference_prose("".join(uses))
     targets: list[str] = []
-    cursor = 0
 
-    def close_bracket(start: int) -> int | None:
+    def close_bracket(start: int, stop: int) -> int | None:
         depth = 1
         position = start + 1
-        while position < len(text_for_uses):
+        while position < stop:
             char = text_for_uses[position]
             if char == "\\":
                 position += 2
@@ -178,56 +218,63 @@ def reference_links(text: str) -> tuple[str, list[str]]:
                 depth -= 1
                 if depth == 0:
                     return position
-            if char == "\n" and re.match(r"[ \t]*\n", text_for_uses[position + 1 :]):
+            if char == "\n" and re.match(
+                r"[ \t]*\n", text_for_uses[position + 1 : stop]
+            ):
                 return None
             position += 1
         return None
 
-    while cursor < len(text_for_uses):
-        if text_for_uses[cursor] == "\\":
-            cursor += 2
-            continue
-        if text_for_uses[cursor] != "[":
-            cursor += 1
-            continue
-        end = close_bracket(cursor)
-        if end is None:
-            cursor += 1
-            continue
-        label = text_for_uses[cursor + 1 : end]
-        following = end + 1
-        if following < len(text_for_uses) and text_for_uses[following] == "(":
-            # Inline destinations have precedence over shortcut references.
-            # Consume their complete label/title, including nested brackets.
-            inline = LINK_RE.match(text_for_uses, cursor)
+    def scan(start: int, stop: int, allow_links: bool = True) -> None:
+        cursor = start
+        while cursor < stop:
+            if text_for_uses[cursor] == "\\":
+                cursor += 2
+                continue
+            if text_for_uses[cursor] != "[":
+                cursor += 1
+                continue
+            end = close_bracket(cursor, stop)
+            if end is None:
+                cursor += 1
+                continue
+            image = cursor > 0 and text_for_uses[cursor - 1] == "!"
+            if not allow_links and not image:
+                scan(cursor + 1, end, allow_links=False)
+                cursor = end + 1
+                continue
+            label = text[cursor + 1 : end]
+            following = end + 1
+            inline = None
+            if following < stop and text_for_uses[following] == "(":
+                # Validate the original destination/title with the unchanged
+                # inline grammar, independently of nested label brackets.
+                inline = LINK_RE.match("[]" + text[following:stop])
             if inline:
-                cursor = inline.end()
+                scan(cursor + 1, end, allow_links=False)
+                # The legacy flat inline pass cannot see a nested outer label.
+                if LINK_RE.match(text, cursor) is None:
+                    targets.append(inline[1])
+                cursor = following + inline.end() - 2
                 continue
-            depth = 1
-            position = following + 1
-            while position < len(text_for_uses) and depth:
-                if text_for_uses[position] == "\\":
-                    position += 2
-                    continue
-                if text_for_uses[position] == "(":
-                    depth += 1
-                elif text_for_uses[position] == ")":
-                    depth -= 1
-                position += 1
-            cursor = position
-            continue
-        if following < len(text_for_uses) and text_for_uses[following] == "[":
-            reference_end = close_bracket(following)
-            if reference_end is None:
-                cursor = following + 1
-                continue
-            explicit = text_for_uses[following + 1 : reference_end]
-            label = explicit or label
-            following = reference_end + 1
-        target = definitions.get(normalize_reference_label(label))
-        if target is not None:
-            targets.append(target)
-        cursor = following
+            if following < stop and text_for_uses[following] == "[":
+                reference_end = close_bracket(following, stop)
+                if reference_end is not None:
+                    explicit = text[following + 1 : reference_end]
+                    label = explicit or label
+                    following = reference_end + 1
+            target = definitions.get(normalize_reference_label(label))
+            if target is not None:
+                targets.append(target)
+                scan(cursor + 1, end, allow_links=False)
+                cursor = following
+            else:
+                # Invalid inline candidates and unresolved outer labels must
+                # not consume later references or legal inner shortcut links.
+                scan(cursor + 1, end, allow_links=allow_links)
+                cursor = end + 1
+
+    scan(0, len(text_for_uses))
     return "".join(inline_text), targets
 
 
