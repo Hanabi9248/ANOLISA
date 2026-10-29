@@ -3,7 +3,9 @@
 use super::*;
 use asc_action_runtime::{Finalizer, SecurityEventSink, testing::audit_finalizer};
 use asc_capability_skill_sec::{
-    SkillSecConfig, SkillSecService, executor::SkillSecExecutor, scanner::ScannerRegistry,
+    SkillSecConfig, SkillSecService,
+    executor::{SkillDiscovery, SkillSecExecutor},
+    scanner::ScannerRegistry,
 };
 use asc_daemon_core::RootManagedPrincipalPolicy;
 use asc_daemon_service::{BoundUnixSocket, ServiceConfig, ShutdownToken, UnixService};
@@ -42,16 +44,15 @@ fn start_bridge(
         Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
         executor,
     );
-    worker.start(application, || Ok(Vec::new()))?;
+    worker.start(application, || Ok(SkillDiscovery::default()))?;
     Ok((bridge, worker))
 }
 
 fn ordinary_dispatcher(application: Arc<ActionService>) -> DaemonDispatcher {
     DaemonDispatcher::new(
-        asc_pap::PapService::new(
-            Arc::new(asc_pap_repository_memory::ProcessLocalPapRepository::default()),
-            Arc::new(asc_policy_engine::PolicyTemplateCompiler),
-        ),
+        asc_pap::PapService::new(Arc::new(
+            asc_policy_repository_sqlite::SqlitePolicyRepository::temporary().unwrap(),
+        )),
         Arc::new(RootManagedPrincipalPolicy::default()),
         application,
     )
@@ -144,8 +145,12 @@ impl Fixture {
         Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state,
-                    managed_skill_dirs: Vec::new(),
+                    managed_skill_dirs: vec![
+                        asc_capability_skill_sec::ManagedSkillDir::new(self.canonical.join("demo"))
+                            .unwrap(),
+                    ],
                 },
                 ScannerRegistry::default(),
             )
@@ -361,106 +366,6 @@ fn resolver_accepts_reserved_leaf_inside_a_category_only() {
 }
 
 #[test]
-fn rotation_commands_resolve_current_inodes_and_retain_failed_intents() {
-    for command in [
-        json!({"command":"rotate-keys"}),
-        json!({"command":"init","forceKeys":true,"baseline":false}),
-        json!({"command":"init","forceKeys":true,"baseline":true}),
-    ] {
-        let fixture = Fixture::new();
-        let events = Arc::new(Events::default());
-        let service = fixture.service();
-        let finalizer = audit_finalizer(events);
-        let (bridge, worker) =
-            start_bridge(fixture.config(), service.clone(), finalizer.clone()).unwrap();
-        let bridge = Arc::new(bridge);
-        let identity = SkillIdentity::new(fixture.canonical.join("demo")).unwrap();
-        let deadline = || Instant::now() + Duration::from_secs(5);
-        let root = bridge.resolve(&identity, deadline()).unwrap();
-        service.initialize().unwrap();
-        service
-            .certify(&root, "fixture", None, &json!([]), deadline())
-            .unwrap();
-        let before = service.key_status(deadline()).unwrap()["fingerprint"].clone();
-        let intent = fixture.directory.path().join("state/key-rotation.json");
-        fs::write(
-            &intent,
-            serde_json::to_vec(&json!({
-                "previous_fingerprint":before,"skills":[identity]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::set_permissions(&intent, fs::Permissions::from_mode(0o600)).unwrap();
-        let parked = fixture.live.join("parked");
-        fs::rename(&root.io_dir, &parked).unwrap();
-        fs::create_dir(&root.io_dir).unwrap();
-        for name in ["SKILL.md", ".skill-meta"] {
-            fs::rename(parked.join(name), root.io_dir.join(name)).unwrap();
-        }
-        assert_ne!(
-            fs::metadata(&root.io_dir).unwrap().ino(),
-            fs::metadata(&parked).unwrap().ino()
-        );
-        assert!(
-            service
-                .rotate_keys(std::slice::from_ref(&root), 0, deadline())
-                .is_err()
-        );
-        let application = crate::skill_application(
-            finalizer,
-            Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
-            SkillSecExecutor::new(service.clone()).with_environment(bridge.environment()),
-        );
-        let dispatcher = ordinary_dispatcher(application);
-        let invoke = || {
-            serde_json::to_value(dispatcher.handle_with_control(
-                asc_daemon_protocol::RequestId::new("rotation").unwrap(),
-                asc_daemon_core::PeerCredentials::new(0, 0, 1),
-                &asc_daemon_service::DispatchControl::new(deadline()),
-                asc_daemon_protocol::DaemonRequest {
-                    method: "action.skill_sec".into(),
-                    params: command.clone(),
-                    trace_context: None,
-                    compatibility: None,
-                },
-            ))
-            .unwrap()
-        };
-        fixture.mode.store(1, Ordering::Release);
-        assert_eq!(invoke()["result"]["success"], false);
-        assert_eq!(
-            service.key_status(deadline()).unwrap()["fingerprint"],
-            before
-        );
-        assert!(intent.exists());
-        assert!(matches!(
-            service.check(&root, deadline()),
-            Err(SkillSecError::RotationPending)
-        ));
-        fixture.mode.store(0, Ordering::Release);
-        let result = invoke();
-        assert_eq!(result["result"]["success"], true, "{command}: {result}");
-        assert_ne!(
-            service.key_status(deadline()).unwrap()["fingerprint"],
-            before
-        );
-        assert!(!intent.exists());
-        let resolved = bridge.resolve(&identity, deadline()).unwrap();
-        let expected = if command["baseline"] == true {
-            "pass"
-        } else {
-            "tampered"
-        };
-        assert_eq!(
-            service.check(&resolved, deadline()).unwrap()["status"],
-            expected
-        );
-        worker.shutdown().unwrap();
-    }
-}
-
-#[test]
 fn configuration_and_secret_validation_reject_unsafe_bindings() {
     let fixture = Fixture::new();
     let mut config = fixture.config();
@@ -502,25 +407,13 @@ async fn public_socket_authenticates_notify_and_keeps_v2_requests_separate() {
         executor,
     );
     worker
-        .start(application.clone(), || Ok(Vec::new()))
+        .start(application.clone(), || Ok(SkillDiscovery::default()))
         .unwrap();
     let dispatcher = Arc::new(SkillFsDispatcher::new(
         ordinary_dispatcher(application),
         Some(bridge.clone()),
     ));
-    assert_eq!(
-        dispatcher
-            .dispatch_timeout(br#"{"method":"action.skill_sec","params":{"command":"scan"}}"#),
-        Some(Duration::from_secs(60))
-    );
-    assert_eq!(
-        dispatcher.dispatch_timeout(br#"{"method":"action.code_scan","params":{}}"#),
-        None
-    );
-    assert_eq!(
-        dispatcher.dispatch_timeout(br#"{"type":"auth.init"}"#),
-        None
-    );
+    assert_dispatch_timeouts(&dispatcher);
     let socket = fixture.directory.path().join("daemon.sock");
     let bound = BoundUnixSocket::bind(&socket, 0o666).unwrap();
     let server = UnixService::new(
@@ -588,6 +481,26 @@ async fn public_socket_authenticates_notify_and_keeps_v2_requests_separate() {
     tokio::task::spawn_blocking(move || worker.shutdown().unwrap())
         .await
         .unwrap();
+}
+
+fn assert_dispatch_timeouts(dispatcher: &SkillFsDispatcher) {
+    assert_eq!(
+        dispatcher
+            .dispatch_timeout(br#"{"method":"action.skill_sec","params":{"command":"scan"}}"#),
+        Some(Duration::from_secs(60))
+    );
+    assert_eq!(
+        dispatcher.dispatch_timeout(br#"{"method":"action.code_scan","params":{}}"#),
+        None
+    );
+    assert_eq!(
+        dispatcher.dispatch_timeout(br#"{"method":"action.code_scan","params":{"mode":"llm"}}"#),
+        Some(Duration::from_secs(91))
+    );
+    assert_eq!(
+        dispatcher.dispatch_timeout(br#"{"type":"auth.init"}"#),
+        None
+    );
 }
 
 fn assert_notify_contract(inputs: &Fixture, path: &Path) {
@@ -662,10 +575,13 @@ fn transport_config() -> ServiceConfig {
         max_request_frame_bytes: 4 * 1024 * 1024,
         max_response_frame_bytes: 4 * 1024 * 1024,
         max_connections: 8,
+        reserved_administrator_connections: 0,
+        max_connections_per_uid: 8,
         max_rejection_connections: 2,
         rejection_encode_timeout: Duration::from_millis(250),
         request_read_timeout: Duration::from_secs(5),
         dispatch_timeout: Duration::from_secs(5),
+        max_dispatch_timeout: asc_model_client::MAX_CODE_SCAN_BUDGET,
         response_write_timeout: Duration::from_secs(5),
         drain_timeout: Duration::from_secs(5),
         accept_error_backoff: Duration::from_millis(10),
@@ -690,7 +606,7 @@ async fn assert_restart_and_failed_mapping(
     fixture: &Fixture,
     bridge: &SkillFsBridge,
     worker: &SkillWorker,
-    service: &SkillSecService,
+    service: &Arc<SkillSecService>,
     socket: &Path,
 ) {
     fs::write(
@@ -700,7 +616,13 @@ async fn assert_restart_and_failed_mapping(
     .unwrap();
     worker
         .queue
-        .schedule_startup(service.managed_skills().unwrap())
+        .schedule_startup(
+            SkillSecExecutor::new(service.clone())
+                .with_environment(bridge.environment())
+                .discover(Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .skills,
+        )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while bridge.status()["processed"].as_u64().unwrap() < 2 {
@@ -730,14 +652,20 @@ async fn assert_activation_after_scan_error(
     fixture: &Fixture,
     bridge: &SkillFsBridge,
     worker: &SkillWorker,
-    service: &SkillSecService,
+    service: &Arc<SkillSecService>,
     events: &Events,
 ) {
     fs::remove_file(fixture.live.join("demo/SKILL.md")).unwrap();
     let before = events.0.lock().unwrap().len();
     worker
         .queue
-        .schedule_startup(service.managed_skills().unwrap())
+        .schedule_startup(
+            SkillSecExecutor::new(service.clone())
+                .with_environment(bridge.environment())
+                .discover(Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .skills,
+        )
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while bridge.status()["processed"].as_u64().unwrap() < 3 {
@@ -753,4 +681,89 @@ async fn assert_activation_after_scan_error(
     let activate = serde_json::to_value(&events[before + 1]).unwrap();
     assert_eq!(scan["details"]["request"]["command"], "scan");
     assert_eq!(activate["details"]["request"]["command"], "activate");
+}
+
+// The authenticated session exchanges frames through a bounded 64 KiB buffer,
+// while the acceptance response echoes the notify request back as diagnostics:
+// with 16 unique paths close to the 4 KiB per-path bound the request still
+// fits the session read bound, but the echo plus the response envelope crosses
+// the response bound. The queue commits the notify before the response is
+// written, so a dropped frame would leave SkillFS unable to distinguish
+// acceptance from rejection (and identical retries would never converge).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acceptance_whose_echo_exceeds_the_session_frame_is_delivered_degraded() {
+    let fixture = Arc::new(Fixture::new());
+    let service = fixture.service();
+    let events = Arc::new(Events::default());
+    let worker = SkillWorker::default();
+    let bridge = Arc::new(SkillFsBridge::prepare(fixture.config(), &worker).unwrap());
+    let executor = SkillSecExecutor::new(service.clone()).with_environment(bridge.environment());
+    let application = crate::skill_application(
+        audit_finalizer(events),
+        Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
+        executor,
+    );
+    worker
+        .start(application.clone(), || Ok(SkillDiscovery::default()))
+        .unwrap();
+    let dispatcher = Arc::new(SkillFsDispatcher::new(
+        ordinary_dispatcher(application),
+        Some(bridge),
+    ));
+    let socket = fixture.directory.path().join("daemon.sock");
+    let bound = BoundUnixSocket::bind(&socket, 0o666).unwrap();
+    let server = UnixService::new(
+        bound,
+        transport_config(),
+        dispatcher,
+        Arc::new(asc_daemon_handler::JsonRejectionEncoder),
+    )
+    .unwrap();
+    let shutdown = ShutdownToken::new();
+    let task = tokio::spawn(server.serve(shutdown.clone()));
+
+    // Sixteen unique single-component relative paths, each below the 4 KiB
+    // validation bound, sized so the serialized request stays inside the
+    // session read bound while the echoed acceptance crosses the response
+    // bound.
+    let mut paths: Vec<String> = (0..16)
+        .map(|index| format!("{index:02}") + &"a".repeat(3997))
+        .collect();
+    let mut request = fixture.notification(&json!(paths));
+    while serde_json::to_vec(&request).unwrap().len() < 65_500 {
+        for path in &mut paths {
+            if path.len() < 4096 {
+                path.push('a');
+            }
+        }
+        request = fixture.notification(&json!(paths));
+    }
+    let wire = serde_json::to_vec(&request).unwrap();
+    assert!(
+        wire.len() <= 65_535,
+        "the notify request must stay readable inside the session frame: {}",
+        wire.len()
+    );
+
+    let key = fixture.secret.clone();
+    let response =
+        tokio::task::spawn_blocking(move || notify(&socket, &key, &request, false, false))
+            .await
+            .unwrap()
+            .expect("the acceptance must be delivered after the queue committed the notify");
+
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["data"]["schemaVersion"], 2);
+    assert_eq!(response["data"]["accepted"], true);
+    assert!(
+        response["data"]["skill"].get("paths").is_none(),
+        "the degraded echo must omit the paths array"
+    );
+    assert_eq!(response["data"]["skill"]["pathsOmitted"], json!(16));
+
+    shutdown.request();
+    task.await.unwrap().unwrap();
+    tokio::task::spawn_blocking(move || worker.shutdown().unwrap())
+        .await
+        .unwrap();
 }

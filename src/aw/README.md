@@ -2,72 +2,101 @@
 
 [中文版](README_zh.md)
 
-AW provides unified configuration, versioned capability contracts and embeddable Core orchestration. `aw-config` validates configuration structure and references; `aw-provider` checks external Provider messages and capability admission offline; `aw-contracts` checks payload shapes and record relationships; `aw-core` executes pinned plans through caller-provided Hosts and journals execution facts. AW has no service process; native Agent control and final tool dispatch remain with the embedding application.
+AW provides unified Hook orchestration, managed MCP integration and hot policy updates for Agents and SDK applications.
+One configuration composes security checks before tool execution, output compression afterward and custom rules.
+Supported resident entrypoints can update policy after tasks drain while keeping the host process running.
+Agents retain their models, interfaces and permissions. AW is available as a Linux Preview.
 
-The interfaces are experimental. Contract tests use synthetic records; command
-transport tests use local child processes. Neither certifies Agent integration.
+## Shared capabilities
 
-## Validate a configuration
+| Capability | What you can do |
+| --- | --- |
+| Hook orchestration | Select rules by target and tool, compose sec-core, Tokenless and custom Hooks, and share step ordering, execution deadlines and audit. |
+| Managed MCP | Apply the same policies at supported actual tool-call boundaries, checking invocation identity and approved arguments. |
+| Policy updates | Explicitly apply a new policy to a supported idle instance so subsequent tasks use the new revision. |
 
-From the repository root, use the offline example to check a configuration:
+Adapters connect native events and adopt supported effects; Providers implement policies.
+Core works independently. Install and enable the corresponding Providers for security checks and compression.
+Tool result replacement is limited to authorized slots, and native Agent permission checks retain precedence.
+
+## Hook support matrix
+
+✓ Declared with contract coverage; × unsupported. Generated from the [regression manifest](tests/regression-matrix.json). See [capability support](../../docs/user-guide/en/aw/capabilities.md) for native replacement limits, MCP and policy updates.
+
+<!-- aw-regression-matrix:start -->
+| Agent | `tool.before` / `observe` | `tool.before` / `block` | `tool.after` / `observe` | `tool.after` / `replace_result` |
+| --- | --- | --- | --- | --- |
+| `agentscope` | ✓ | ✓ | ✓ | ✓ |
+| `claude-sdk` | ✓ | ✓ | ✓ | ✓ |
+| `hermes` | ✓ | ✓ | ✓ | ✓ |
+| `openclaw` | ✓ | ✓ | ✓ | ✓ |
+| `pi` | ✓ | ✓ | ✓ | ✓ |
+| `qoder` | ✓ | ✓ | ✓ | ✓ |
+| `qoder-sdk` | ✓ | ✓ | ✓ | × |
+| `qwenpaw` | ✓ | ✓ | ✓ | ✓ |
+<!-- aw-regression-matrix:end -->
+
+<a id="install-and-use"></a>
+
+## Installation and first run
+
+Get and install a Preview package using the [installation guide](../../docs/user-guide/en/aw/installation.md).
+AW currently uses standalone packages; `anolisa install aw` and RPM installation are not available yet.
+Install and sign in to your Agent first, then generate configuration with `aw config init`.
+
+The example below uses an installed, signed-in Qoder. `AW_PREFIX` is the installation directory
+selected in the guide; both `qodercli` and `aw` must be on `PATH`.
 
 ```bash
-cd src/aw
-cargo run --locked -p aw-config --example validate -- crates/aw-config/examples/aw.minimal.yaml
+export AW_HOME="$HOME/aw"
+install -d -m 700 "$AW_HOME" "$AW_HOME/workspace"
+aw config init --prefix "$AW_PREFIX" \
+  --config "$AW_HOME/aw.yaml" --state-dir "$AW_HOME/state" \
+  --qoder "$(command -v qodercli)"
+aw validate --config "$AW_HOME/aw.yaml"
+cd "$AW_HOME/workspace"
+aw run --config "$AW_HOME/aw.yaml" --agent qoder
 ```
 
-A successful result confirms configuration syntax and static references. It does
-not start an Agent or enable a policy. See the [configuration guide](../../docs/developer-guide/en/aw/configuration.md)
-for fields and examples, and [Contributing to AW](CONTRIBUTING.md) for development
-setup, tests and CI.
+In Qoder, ask it to read the current directory with a tool and follow its native permission prompts.
+The local service remains reusable after the Agent exits. Inspect and stop it when finished.
 
-## Core embedding
+```bash
+aw status --config "$AW_HOME/aw.yaml"
+aw stop --config "$AW_HOME/aw.yaml"
+```
 
-`aw-core` provides `Core::prepare` and `Core::execute`, trusted Host/Clock/Journal
-ports, and a durable Linux `FileJournal`. Preparation checks the complete plan
-before any provider call. Execution records each call before dispatch and returns
-terminal results only after the journal acknowledges them. Failed or interrupted
-events remain reserved; there is no automatic retry or recovery.
+<a id="hook-support"></a>
+<a id="adapter-capability-coverage"></a>
 
-See [Core execution and storage](docs/design/core-execution.md) for ownership,
-cancellation, failure and embedding contracts. Core tests use synthetic Hosts;
-native Agent integration and effect adoption require separate runtime validation.
+## Supported entrypoints
 
-## Command execution
+AW currently integrates Qoder CLI, Qoder SDK, OpenClaw, Hermes, QwenPaw, Pi SDK,
+Claude SDK and AgentScope SDK. CLI integrations use native Hooks or plugins;
+SDK applications explicitly use managed factories. Runtime admission checks the required
+native interfaces; [verified baselines](../../docs/developer-guide/en/aw/native-agents.md)
+record the tested framework versions.
+[Qoder SDK integration](../../docs/developer-guide/en/aw/agents/qoder-sdk.md) also covers pinned Bash consumers, Worker imports and declarative role assets.
+The [capability matrix](../../docs/user-guide/en/aw/capabilities.md) compares result handling,
+MCP and policy updates by Adapter and launch mode, with links to verified baselines and setup.
 
-`aw-exec` runs individual commands on Linux with an absolute deadline, byte limits,
-cancellation and owned process-group cleanup. Native stdout, stderr and exit status
-remain for the caller to interpret. This library provides process transport;
-Provider protocol wiring, daemon and Agent adapters remain separate work.
-See [bounded command execution](docs/design/bounded-execution.md) for its API,
-ownership and validation boundaries.
+## Documentation
 
-## Source reference
+| Task | Guide |
+| --- | --- |
+| Install and complete a first run | [AW user manual](../../docs/user-guide/en/aw/index.md) |
+| Select an Agent, configure rules and update policy | [Configuration and launch](../../docs/user-guide/en/aw/configuration.md) |
+| Enable output compression or security checks | [Tokenless](../../docs/user-guide/en/aw/tokenless.md), [sec-core](../../docs/user-guide/en/aw/security.md) |
+| Inspect runtime records | [AgentSight](../../docs/user-guide/en/aw/observability.md) |
+| Check status, upgrade/uninstall and troubleshoot | [Operations](../../docs/user-guide/en/aw/operations.md) |
+| Write Providers, integrate SDKs or understand the architecture | [Developer guide](../../docs/developer-guide/en/aw/index.md) |
 
-- [User guide and availability](../../docs/user-guide/en/user-entrypoint/aw.md),
-  [configuration reference](../../docs/developer-guide/en/aw/configuration.md),
-  [starter configuration](crates/aw-config/examples/aw.minimal.yaml),
-  [full example](crates/aw-config/examples/aw.yaml) and
-  [configuration API](crates/aw-config/src/lib.rs)
-- [Registered schemas](schemas/) and [synthetic payload examples](tests/fixtures/contracts.json)
-- [Public API](src/lib.rs), [record validation](src/validation.rs) and [plan validation](src/orchestration.rs)
-- [External Provider protocol and admission](docs/design/provider-protocol.md)
-  and [Provider API](crates/aw-provider/src/lib.rs)
-- [Encoding tests](tests/canonical.rs), [schema tests](tests/schemas.rs),
-  [record tests](tests/contracts.rs) and [plan tests](tests/orchestration.rs)
+<a id="code-architecture"></a>
+<a id="development-and-validation"></a>
 
-The Registry includes 21 schema resources. The eight v1 resources in `crates/aw-contracts/schemas/` are reference copies and are not registered. Callers must use matching schema IDs and digests; no automatic version conversion is provided.
+The [architecture overview](docs/design/en/architecture.md) describes framework and Provider ownership and call paths.
+See [Contributing](CONTRIBUTING.md) for source builds, tests and CI entrypoints.
 
-Parse incoming wire records with `canonical::parse` before schema validation. Shape checks alone do not validate record relationships or grant authorization. Follow the public API documentation for plan-level checks; callers remain responsible for authenticating evidence and enforcing actions.
-
-User configuration uses the separate `aw-config` crate and its bundled
-`aw/v1alpha1` schema. It accepts one `AWConfiguration` object with
-`apiVersion`, `kind`, `metadata` and `spec`; Provider instances are named objects
-under `spec.providers`. The schema recognizes QwenPaw, Qoder CLI, OpenClaw,
-Hermes and all 16 event names, without claiming adapters are implemented.
-Configuration has no runtime `status`. `aw-provider` validates externally supplied
-operation/private-config responses and admits tool steps against caller-trusted
-Adapter capabilities. It does not execute discovery or establish native adoption.
-Provider execution and binding installation remain subsequent work.
-See the [configuration design](docs/design/configuration.md) for the separation
-from the existing wire contracts.
+`aw config add-native-source` records native source references without opening or
+rewriting their files. The shared loader API retains native configuration and
+reports admission separately from activation; see [configuration](../../docs/user-guide/en/aw/configuration.md#record-native-configuration-sources).

@@ -3,7 +3,7 @@
 //! Computes 9 skill-related metrics from extracted skill events.
 
 use chrono::Datelike;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::storage::sqlite::genai::TraceEventDetail;
 
@@ -97,10 +97,15 @@ impl ExtractedData {
         let mut all_sessions: HashSet<String> = HashSet::new();
 
         for event in events {
+            // conversation_id groups every LLM call of one user query — the
+            // task/session these metrics are documented over (call_builder
+            // and the genai events writer agree). trace_id is the per-call
+            // response id and only remains as a fallback for rows written
+            // before the conversation column existed.
             let session_id = event
-                .trace_id
+                .conversation_id
                 .clone()
-                .or_else(|| event.conversation_id.clone())
+                .or_else(|| event.trace_id.clone())
                 .unwrap_or_default();
             // Rows with neither id cannot be attributed to any session;
             // counting them as one phantom "" session skews every
@@ -124,7 +129,7 @@ impl ExtractedData {
 // --- Metric 1: Skill Download Count ---
 
 fn compute_downloads(data: &ExtractedData) -> SkillDownloadMetrics {
-    let mut downloads: HashMap<String, SkillFirstSeen> = HashMap::new();
+    let mut downloads: BTreeMap<String, SkillFirstSeen> = BTreeMap::new();
 
     // Track sessions per skill for total_sessions count. Records from
     // id-less rows carry an empty session id and are not real sessions.
@@ -138,8 +143,11 @@ fn compute_downloads(data: &ExtractedData) -> SkillDownloadMetrics {
                 .insert(record.session_id.clone());
         }
 
-        // Keep the earliest record as "first seen" — the input is not
-        // guaranteed to be sorted, so first-insert would be whichever
+        // Keep the earliest record that can name a session as "first seen":
+        // an id-less row is not a session (see the set above), so it may
+        // report the earliest sighting of a skill no attributed row has seen,
+        // but it never becomes the first-seen session itself. The input is
+        // not guaranteed to be sorted, so first-insert would be whichever
         // record the caller happened to pass first.
         let entry = downloads
             .entry(record.skill_name.clone())
@@ -148,8 +156,13 @@ fn compute_downloads(data: &ExtractedData) -> SkillDownloadMetrics {
                 first_seen_timestamp_ns: record.timestamp_ns,
                 total_sessions: 0,
             });
-        if record.timestamp_ns < entry.first_seen_timestamp_ns {
-            entry.first_seen_session_id = record.session_id.clone();
+        let earlier = record.timestamp_ns < entry.first_seen_timestamp_ns;
+        if !record.session_id.is_empty() {
+            if earlier || entry.first_seen_session_id.is_empty() {
+                entry.first_seen_session_id = record.session_id.clone();
+                entry.first_seen_timestamp_ns = record.timestamp_ns;
+            }
+        } else if earlier && entry.first_seen_session_id.is_empty() {
             entry.first_seen_timestamp_ns = record.timestamp_ns;
         }
     }
@@ -167,7 +180,7 @@ fn compute_downloads(data: &ExtractedData) -> SkillDownloadMetrics {
 // --- Metric 2: Skill Load Count ---
 
 fn compute_loads(data: &ExtractedData) -> SkillLoadMetrics {
-    let mut loads: HashMap<String, u64> = HashMap::new();
+    let mut loads: BTreeMap<String, u64> = BTreeMap::new();
 
     for record in &data.load_records {
         *loads.entry(record.skill_name.clone()).or_default() += 1;
@@ -410,6 +423,35 @@ mod tests {
         assert!((percentile(&data, 50.0) - 5.5).abs() < 0.01);
     }
 
+    /// The response carries `loads` and `downloads` as JSON objects, so their key
+    /// order is the map's iteration order. A `HashMap`'s is arbitrary and differs
+    /// between two identical requests, which makes the dashboard's tie-break
+    /// order — and any diff of two responses — unstable. The CLI tables were
+    /// ordered for exactly this reason; the HTTP path was not.
+    #[test]
+    fn the_load_map_serializes_in_a_defined_order() {
+        let events: Vec<TraceEventDetail> = ["zulu", "alpha", "mike", "kilo", "yankee"]
+            .iter()
+            .enumerate()
+            .map(|(i, skill)| {
+                load_event(
+                    i as i64 + 1,
+                    1_778_000_000_000_000_000 + i as i64,
+                    "s1",
+                    skill,
+                )
+            })
+            .collect();
+
+        let report = compute_skill_metrics(&events, &MetricOptions::all());
+        let json = serde_json::to_string(&report.loads.expect("loads")).unwrap();
+
+        assert!(
+            json.starts_with(r#"{"loads":{"alpha":1,"kilo":1,"mike":1,"yankee":1,"zulu":1}"#),
+            "the load map must serialize in a defined order, got {json}"
+        );
+    }
+
     #[test]
     fn test_compute_empty_events() {
         let report = compute_skill_metrics(&[], &MetricOptions::all());
@@ -449,8 +491,8 @@ mod tests {
             pid: Some(100),
             user_query: None,
             event_json: None,
-            trace_id: Some(session.into()),
-            conversation_id: Some("conv-1".into()),
+            trace_id: Some(format!("resp-{session}")),
+            conversation_id: Some(session.into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,
@@ -494,12 +536,47 @@ mod tests {
             pid: Some(100),
             user_query: None,
             event_json: None,
-            trace_id: Some(session.into()),
-            conversation_id: Some("conv-1".into()),
+            trace_id: Some(format!("resp-{session}")),
+            conversation_id: Some(session.into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,
         }
+    }
+
+    /// One task (one conversation) makes several LLM calls with distinct
+    /// response ids (trace_id). Only the call that reads SKILL.md uses a
+    /// skill, so the task-level usage ratio is 1.0 — not 1/calls.
+    #[test]
+    fn one_task_with_several_calls_counts_as_one_session() {
+        use crate::genai::semantic::{MessagePart, OutputMessage};
+
+        let mut with_skill = load_event(1, 1_000_000_000, "conv-task-1", "pdf");
+        with_skill.trace_id = Some("chatcmpl-call-1".into());
+        with_skill.conversation_id = Some("conv-task-1".into());
+
+        let mut without_skill = load_event(2, 1_000_000_100, "conv-task-1", "pdf");
+        without_skill.trace_id = Some("chatcmpl-call-2".into());
+        without_skill.conversation_id = Some("conv-task-1".into());
+        // The later call's output carries no SKILL.md read.
+        without_skill.output_messages = Some(
+            serde_json::to_string(&vec![OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![MessagePart::Text {
+                    content: "done".to_string(),
+                }],
+                name: None,
+                finish_reason: Some("stop".to_string()),
+            }])
+            .unwrap(),
+        );
+
+        let report = compute_skill_metrics(&[with_skill, without_skill], &MetricOptions::all());
+        let usage = report.usage_ratio.unwrap();
+        assert_eq!(usage.total_sessions, 1);
+        assert_eq!(usage.with_skill_count, 1);
+        assert_eq!(usage.without_skill_count, 0);
+        assert_eq!(usage.ratio, 1.0);
     }
 
     #[test]
@@ -647,6 +724,44 @@ mod tests {
         let seen = downloads.downloads.get("test-skill").unwrap();
         assert_eq!(seen.first_seen_timestamp_ns, 10_000);
         assert_eq!(seen.first_seen_session_id, "session-early");
+    }
+
+    #[test]
+    fn an_id_less_download_does_not_become_the_first_seen_session() {
+        // A row with neither id carries no session: the phantom "" session
+        // this metric already drops from its per-session sets must not name
+        // the first-seen session either. The earliest record that can name
+        // one does, in either input order.
+        let id_less_event = |id: i64| {
+            let mut event = skill_event(id, 10_000, "unused");
+            event.trace_id = None;
+            event.conversation_id = None;
+            event
+        };
+        for events in [
+            [id_less_event(1), skill_event(2, 30_000, "session-real")],
+            [skill_event(3, 30_000, "session-real"), id_less_event(4)],
+        ] {
+            let report = compute_skill_metrics(&events, &MetricOptions::all());
+            let downloads = report.downloads.unwrap();
+            let seen = downloads.downloads.get("test-skill").unwrap();
+            assert_eq!(
+                seen.first_seen_session_id, "session-real",
+                "an id-less row is not a session and cannot be the first-seen one"
+            );
+            assert_eq!(
+                seen.first_seen_timestamp_ns, 30_000,
+                "the first-seen pair belongs to the earliest record naming a session"
+            );
+        }
+
+        // A skill seen only in id-less rows keeps its earliest sighting;
+        // there is no session to name with it.
+        let report = compute_skill_metrics(&[id_less_event(5)], &MetricOptions::all());
+        let downloads = report.downloads.unwrap();
+        let seen = downloads.downloads.get("test-skill").unwrap();
+        assert_eq!(seen.first_seen_session_id, "");
+        assert_eq!(seen.first_seen_timestamp_ns, 10_000);
     }
 
     #[test]

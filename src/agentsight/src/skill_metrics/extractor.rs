@@ -9,7 +9,9 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::genai::semantic::{InputMessage, MessagePart, OutputMessage};
+#[cfg(test)]
+use crate::genai::semantic::InputMessage;
+use crate::genai::semantic::{MessagePart, OutputMessage};
 use crate::storage::sqlite::genai::TraceEventDetail;
 
 use super::types::{SkillDownloadRecord, SkillLoadRecord};
@@ -65,10 +67,13 @@ const SKILL_FUNCTION_NAMES: &[&str] = &["skill", "skill_view"];
 /// For other agents: parses `system_instructions` JSON (Vec<InputMessage>)
 /// and applies regex to extract skill names from the XML block.
 pub fn extract_skill_downloads(event: &TraceEventDetail) -> Vec<SkillDownloadRecord> {
+    // conversation_id groups every LLM call of one user query (the task
+    // these session records are documented over); trace_id is the per-call
+    // response id and only remains as a fallback.
     let session_id = event
-        .trace_id
+        .conversation_id
         .clone()
-        .or_else(|| event.conversation_id.clone())
+        .or_else(|| event.trace_id.clone())
         .unwrap_or_default();
     let timestamp_ns = event.start_timestamp_ns;
 
@@ -177,10 +182,13 @@ fn detect_skill_load(name: &str, arguments: &Option<serde_json::Value>) -> Optio
 /// Looks for tool calls where function_name matches Read/ReadFile/read_file
 /// and the file_path argument ends with `/SKILL.md`.
 pub fn extract_skill_loads(event: &TraceEventDetail) -> Vec<SkillLoadRecord> {
+    // conversation_id groups every LLM call of one user query (the task
+    // these session records are documented over); trace_id is the per-call
+    // response id and only remains as a fallback.
     let session_id = event
-        .trace_id
+        .conversation_id
         .clone()
-        .or_else(|| event.conversation_id.clone())
+        .or_else(|| event.trace_id.clone())
         .unwrap_or_default();
     let call_id = event.call_id.clone().unwrap_or_default();
     let timestamp_ns = event.start_timestamp_ns;
@@ -246,7 +254,7 @@ pub fn extract_tool_function_names(event: &TraceEventDetail) -> Vec<String> {
 fn extract_system_text(event: &TraceEventDetail) -> String {
     if let Some(json_str) = &event.system_instructions {
         // Try parsing as Vec<InputMessage> first
-        if let Ok(msgs) = serde_json::from_str::<Vec<InputMessage>>(json_str) {
+        if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json_str) {
             let mut text = String::new();
             for msg in &msgs {
                 if msg.role == "system" {
@@ -281,11 +289,16 @@ fn extract_system_text(event: &TraceEventDetail) -> String {
 /// Sub-directories within those (i.e. category folders like `ai/`, `devops/`)
 /// are also scanned one level deep to match the os-skills layout.
 fn scan_system_skills_dir() -> Vec<String> {
-    scan_skills_dir_recursive(SYSTEM_SKILLS_DIR, 2)
+    scan_skills_dir_recursive(std::path::Path::new(SYSTEM_SKILLS_DIR), 2)
 }
 
 /// Recursively scan a skills directory up to `depth` levels.
-fn scan_skills_dir_recursive(dir: &str, depth: u32) -> Vec<String> {
+///
+/// The walk takes a `Path` and recurses with the path it already holds: a
+/// category folder can carry any bytes a directory name may hold, and
+/// rebuilding its path from the lossy display form made `read_dir` fail, so
+/// every skill under such a folder disappeared from the report.
+fn scan_skills_dir_recursive(dir: &std::path::Path, depth: u32) -> Vec<String> {
     if depth == 0 {
         return Vec::new();
     }
@@ -301,13 +314,16 @@ fn scan_skills_dir_recursive(dir: &str, depth: u32) -> Vec<String> {
         }
         // Check if this directory contains SKILL.md
         if path.join("SKILL.md").exists() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                names.push(name.to_string());
+            // The name is a label for the report, never a path to open: render
+            // it like every other display name in this component, so a skill
+            // whose directory name is not UTF-8 is still reported instead of
+            // dropped from the list as if it were not installed.
+            if let Some(name) = path.file_name() {
+                names.push(name.to_string_lossy().into_owned());
             }
         } else {
             // No SKILL.md here — it may be a category folder; recurse
-            let sub = path.to_string_lossy().into_owned();
-            names.extend(scan_skills_dir_recursive(&sub, depth - 1));
+            names.extend(scan_skills_dir_recursive(&path, depth - 1));
         }
     }
     names
@@ -356,7 +372,7 @@ fn scan_qwen_user_skills_dirs_in(home_roots: &[&str]) -> Vec<String> {
             if !target.is_dir() {
                 continue;
             }
-            for found in scan_skills_dir_recursive(&target.to_string_lossy(), 2) {
+            for found in scan_skills_dir_recursive(&target, 2) {
                 if !names.contains(&found) {
                     names.push(found);
                 }
@@ -619,8 +635,8 @@ the list is refreshed later in the prompt:
             pid: Some(100),
             user_query: None,
             event_json: None,
-            trace_id: Some("session-1".into()),
-            conversation_id: Some("conv-1".into()),
+            trace_id: Some("resp-1".into()),
+            conversation_id: Some("session-1".into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,
@@ -658,8 +674,8 @@ the list is refreshed later in the prompt:
             pid: Some(9999),
             user_query: None,
             event_json: None,
-            trace_id: Some("cosh-session-1".into()),
-            conversation_id: Some("cosh-conv-1".into()),
+            trace_id: Some("resp-cosh-1".into()),
+            conversation_id: Some("cosh-session-1".into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,
@@ -679,7 +695,10 @@ the list is refreshed later in the prompt:
     #[test]
     fn test_scan_system_skills_dir_missing_dir() {
         // scan_skills_dir_recursive should return empty vec when dir doesn't exist
-        let result = scan_skills_dir_recursive("/nonexistent/path/that/does/not/exist", 2);
+        let result = scan_skills_dir_recursive(
+            std::path::Path::new("/nonexistent/path/that/does/not/exist"),
+            2,
+        );
         assert!(result.is_empty());
     }
 
@@ -705,7 +724,7 @@ the list is refreshed later in the prompt:
         )
         .unwrap();
 
-        let names = scan_skills_dir_recursive(&tmp.to_string_lossy(), 2);
+        let names = scan_skills_dir_recursive(&tmp, 2);
         assert!(
             names.contains(&"install-copaw".to_string()),
             "expected install-copaw in {names:?}"
@@ -716,6 +735,72 @@ the list is refreshed later in the prompt:
         );
 
         // cleanup
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A category folder can carry any bytes a directory name may hold, so the
+    /// walk must recurse with the path it already holds. Rebuilding that path
+    /// from the lossy display form made `read_dir` fail, and every skill under
+    /// the folder disappeared from the report.
+    #[test]
+    fn test_scan_skills_dir_recursive_keeps_a_non_utf8_category_path() {
+        use std::fs;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_test_scan_skills_raw_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        // A category folder whose name carries a raw 0xFF byte, holding one
+        // skill, next to an ordinary skill at the top level.
+        let category = tmp.join(std::ffi::OsStr::from_bytes(b"cat\xff"));
+        let nested = category.join("nested-skill");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("SKILL.md"), "---\nname: nested-skill\n---").unwrap();
+        let plain = tmp.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("SKILL.md"), "---\nname: plain\n---").unwrap();
+
+        let names = scan_skills_dir_recursive(&tmp, 2);
+        assert!(
+            names.contains(&"nested-skill".to_string()),
+            "the skill under the non-UTF-8 category must be found: {names:?}"
+        );
+        assert!(names.contains(&"plain".to_string()), "{names:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The reported name is a label for the report, not a path to open, and a
+    /// skill directory whose name is not UTF-8 used to be dropped from the
+    /// report entirely — its name could not be turned into the `String` this
+    /// function returns, so an installed skill was invisible.
+    #[test]
+    fn test_scan_skills_dir_recursive_reports_a_non_utf8_skill_name() {
+        use std::fs;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_test_scan_skills_raw_name_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let skill = tmp.join(std::ffi::OsStr::from_bytes(b"skill\xff"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: raw\n---").unwrap();
+
+        let names = scan_skills_dir_recursive(&tmp, 2);
+        assert_eq!(
+            names.len(),
+            1,
+            "the skill is installed and must be listed: {names:?}"
+        );
+        assert!(
+            names[0].contains('\u{fffd}'),
+            "the name is rendered for display, like every other name: {names:?}"
+        );
+
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -871,8 +956,8 @@ the list is refreshed later in the prompt:
             pid: Some(8888),
             user_query: None,
             event_json: None,
-            trace_id: Some("qwen-session-1".into()),
-            conversation_id: Some("qwen-conv-1".into()),
+            trace_id: Some("resp-qwen-1".into()),
+            conversation_id: Some("qwen-session-1".into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,

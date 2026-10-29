@@ -8,9 +8,11 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -97,28 +99,43 @@ def missing_python_modules() -> list[str]:
 def run_check(
     command: list[str], cwd: Path, log_path: Path, checks: list[dict[str, object]]
 ) -> int:
-    """Run one check, append its durable record, and return its exit code."""
+    """Run one check, append its durable record, and return its exit code.
+
+    A check that cannot be launched at all (a missing ``rustup``/``cargo`` is the
+    canonical case for this runner) is recorded as a failure instead of raising:
+    the exception would escape before the record is appended, so the run died
+    with a traceback, published no report (``write_report`` runs only after the
+    first check) and skipped every later gate.
+    """
     started = time.time()
     with log_path.open("w", encoding="utf-8") as log:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            returncode = result.returncode
+        except OSError as error:
+            # 127 is the shell's "command not found"; any launch failure is a
+            # failed check, and the reason belongs in its log for the report.
+            log.write(f"failed to launch {shlex.join(command)}: {error}\n")
+            returncode = 127
     checks.append(
         {
             "command": shlex.join(command),
+            "argv": list(command),
             "cwd": str(cwd),
             "log": log_path.name,
             "started_at_unix": started,
             "duration_seconds": time.time() - started,
-            "exit_code": result.returncode,
+            "exit_code": returncode,
         }
     )
-    return result.returncode
+    return returncode
 
 
 def write_report(
@@ -128,8 +145,8 @@ def write_report(
     full: bool = False,
     cargo_jobs: int | None = None,
 ) -> None:
-    """Write partial progress after every command so failures remain visible."""
-    output.write_text(
+    """Publish complete progress atomically, retaining the previous report on failure."""
+    payload = (
         json.dumps(
             {
                 "schema_version": 1,
@@ -140,9 +157,20 @@ def write_report(
             indent=2,
             sort_keys=True,
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
+    target = output.resolve()
+    with tempfile.TemporaryDirectory(
+        prefix=f".{target.name}-", dir=target.parent
+    ) as staging:
+        staged = Path(staging) / target.name
+        with staged.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if target.exists():
+            shutil.copymode(target, staged)
+        os.replace(staged, target)
 
 
 def report_progress(label: str, status: int, log_path: Path) -> None:

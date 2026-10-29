@@ -21,8 +21,8 @@ use asc_daemon::{BootstrapConfig, serve};
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
-use asc_policy_engine::PolicyTemplateCompiler;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
+
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
 
@@ -77,10 +77,7 @@ impl RunningDaemon {
         ));
         std::fs::create_dir(&directory).unwrap();
         let socket_path = directory.join("daemon.sock");
-        let application = PapService::new(
-            Arc::new(ProcessLocalPapRepository::default()),
-            Arc::new(PolicyTemplateCompiler),
-        );
+        let application = PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap()));
         let output = Arc::new(Outputs::default());
         let dispatcher = Arc::new(DaemonDispatcher::new(
             application,
@@ -282,6 +279,35 @@ async fn a_local_user_scans_dangerous_bash_and_receives_the_verdict() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_keyword_command_arguments_reuse_bash_findings() {
+    let daemon = RunningDaemon::start(PrincipalRole::LocalUser).await;
+    let bash = support::request_json(
+        &daemon.socket_path,
+        &json!({
+            "method": "action.code_scan",
+            "params": {"code": "rm -rf /tmp/test", "language": "bash"}
+        }),
+    )
+    .await;
+    let python = support::request_json(
+        &daemon.socket_path,
+        &json!({
+            "method": "action.code_scan",
+            "params": {
+                "code": r#"subprocess.Popen(args="rm -rf /tmp/test", shell=True)"#,
+                "language": "python"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(python["result"]["verdict"], bash["result"]["verdict"]);
+    assert_eq!(python["result"]["findings"], bash["result"]["findings"]);
+    assert_eq!(python["result"]["language"], json!("python"));
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dotted_action_alias_is_not_registered() {
     let daemon = RunningDaemon::start(PrincipalRole::LocalUser).await;
     let response = support::request_json(
@@ -355,6 +381,31 @@ async fn malformed_parameters_are_rejected_as_invalid_request() {
         json!("invalid_request"),
         "{response}"
     );
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn llm_mode_rejects_blank_input_before_model_lookup() {
+    // This is intentionally independent of the host's Ollama state. V1 rejects
+    // blank input before selecting its LLM engine, and the daemon must preserve
+    // that response at the public socket boundary.
+    let daemon = RunningDaemon::start(PrincipalRole::LocalUser).await;
+    let response = support::request_json(
+        &daemon.socket_path,
+        &json!({
+            "method": "action.code_scan",
+            "params": {"code": " \n\t", "language": "bash", "mode": "llm"}
+        }),
+    )
+    .await;
+    assert_eq!(response["result"]["ok"], json!(false), "{response}");
+    assert_eq!(response["result"]["verdict"], json!("error"), "{response}");
+    assert_eq!(
+        response["result"]["summary"],
+        json!("scan error: empty input code"),
+        "{response}"
+    );
+    assert_eq!(response["result"]["elapsed_ms"], json!(0), "{response}");
     daemon.stop().await;
 }
 

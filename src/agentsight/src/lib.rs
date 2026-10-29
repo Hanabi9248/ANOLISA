@@ -39,17 +39,17 @@ pub mod preferences;
 mod private_sqlite;
 // Cross-platform: labels are derived from collected trajectories, which exist on
 // every OS, so the Linux and macOS servers share one implementation. Nothing
-// here touches eBPF.
+// here touches eBPF. Gated on `server` because the judge needs the opt LLM client.
+#[cfg(feature = "server")]
 pub mod reuse;
 pub mod security;
 // Cross-platform: the request/response contract and LLM ranking call behind
 // `POST /api/sessions/search`, shared by the Linux and macOS server handlers.
+#[cfg(feature = "server")]
 pub mod semantic_search;
-pub mod tokenizer;
-// Cross-platform: offline ChatML token-consumption breakdown over Chrome
-// Trace files (`agentsight analyze-chatml`); pure analysis over `chrome_trace`
-// and `tokenizer`, no eBPF dependency.
+#[cfg(target_os = "linux")]
 pub mod token_breakdown;
+pub mod tokenizer;
 pub mod utils;
 
 // ─── Linux-only modules (eBPF observability pipeline) ──────────────────────
@@ -83,6 +83,8 @@ pub mod interruption;
 #[cfg(target_os = "linux")]
 pub mod parser;
 #[cfg(target_os = "linux")]
+pub mod pipeline_core;
+#[cfg(target_os = "linux")]
 pub mod probes;
 #[cfg(target_os = "linux")]
 pub mod response_map;
@@ -94,6 +96,7 @@ pub mod server;
 pub mod skill_metrics;
 #[cfg(target_os = "linux")]
 pub mod storage;
+pub mod storage_budget;
 pub mod storage_status;
 #[cfg(target_os = "linux")]
 mod unified;

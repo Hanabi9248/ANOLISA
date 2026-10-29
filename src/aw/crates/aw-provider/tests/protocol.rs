@@ -204,6 +204,73 @@ fn invocation_binds_config_event_budget_and_identity_without_canonical_coercion(
 }
 
 #[test]
+fn hook_binding_preserves_event_limits_without_relaxing_provider_wire_limits() {
+    let protocol = Protocol::new().unwrap();
+    let mut value = invoke("tool.before", json!(["block"]));
+    value["operation"] = json!("invoke");
+    value["config"] = json!({});
+    value["event"]["tool"]["input"] = json!("");
+    let overhead = bytes(&value["event"]).len();
+    value["event"]["tool"]["input"] = json!("I".repeat(MAX_MESSAGE_BYTES - overhead));
+    assert_eq!(bytes(&value["event"]).len(), MAX_MESSAGE_BYTES);
+    assert!(protocol.bind_invocation(value.clone()).is_err());
+    let hook = protocol.bind_hook_invocation(value.clone()).unwrap();
+    assert!(protocol.parse_request(&bytes(hook.as_value())).is_err());
+    let mut reply = response();
+    reply["input_digest"] = hook.as_value()["input_digest"].clone();
+    reply["effects"] = json!([{"type":"block"}]);
+    assert!(matches!(
+        protocol.check_response(&hook, &bytes(&reply)),
+        Ok(Reply::Invocation(_))
+    ));
+    value["event"]["tool"]["input"] = json!("I".repeat(MAX_MESSAGE_BYTES - overhead + 1));
+    assert!(protocol.bind_hook_invocation(value.clone()).is_err());
+    let mut nested = json!("leaf");
+    for _ in 0..MAX_DEPTH - 2 {
+        nested = json!([nested]);
+    }
+    value["event"]["tool"]["input"] = nested.clone();
+    assert!(protocol.bind_invocation(value.clone()).is_err());
+    let hook = protocol.bind_hook_invocation(value.clone()).unwrap();
+    assert!(protocol.parse_request(&bytes(hook.as_value())).is_err());
+    value["event"]["tool"]["input"] = json!([nested]);
+    assert!(protocol.bind_hook_invocation(value).is_err());
+}
+
+#[test]
+fn hook_binding_keeps_request_shape_and_capability_validation() {
+    let protocol = Protocol::new().unwrap();
+    let mut value = invoke("tool.before", json!(["block"]));
+    value["operation"] = json!("invoke");
+    value["config"] = json!({});
+    let hook = protocol.bind_hook_invocation(value.clone()).unwrap();
+    let provider = protocol.bind_invocation(value.clone()).unwrap();
+    assert_eq!(
+        hook.as_value()["input_digest"],
+        provider.as_value()["input_digest"]
+    );
+    for (pointer, replacement) in [
+        ("/method", json!("describe")),
+        ("/operation", json!("check")),
+        ("/config", json!({"ignored":true})),
+        ("/request_id", json!("R".repeat(129))),
+        ("/config_revision", json!("invalid")),
+        ("/budget_ms", json!(0)),
+        ("/allowed_effects", json!(["ask"])),
+        ("/event/tool/result", json!({"unexpected":true})),
+    ] {
+        let mut invalid = value.clone();
+        *invalid.pointer_mut(pointer).unwrap() = replacement;
+        assert!(protocol.bind_hook_invocation(invalid).is_err(), "{pointer}");
+    }
+    let mut invalid = value.clone();
+    invalid["input_digest"] = json!(format!("sha256:{}", "0".repeat(64)));
+    assert!(protocol.bind_hook_invocation(invalid).is_err());
+    value["unknown"] = json!(true);
+    assert!(protocol.bind_hook_invocation(value).is_err());
+}
+
+#[test]
 fn after_preserves_null_structured_multimodal_and_failed_results() {
     let protocol = Protocol::new().unwrap();
     for result in [
@@ -250,7 +317,7 @@ fn responses_cannot_escalate_effects_or_change_request_binding() {
         ("tool.before", "ask"),
         ("tool.before", "replace_input"),
         ("tool.after", "block"),
-        ("tool.after", "replace_result"),
+        ("tool.before", "replace_result"),
     ] {
         assert!(protocol
             .bind_invocation(invoke(event, json!([effect])))
@@ -367,4 +434,62 @@ fn finite_float_parameters_round_trip_through_invocation_binding() {
         );
         protocol.parse_request(&bytes(request.as_value())).unwrap();
     }
+}
+
+#[test]
+fn block_text_is_a_bounded_reason_and_never_an_input_replacement() {
+    let protocol = Protocol::new().unwrap();
+    let request = protocol
+        .bind_invocation(invoke("tool.before", json!(["block"])))
+        .unwrap();
+    let mut reply = response();
+    reply["input_digest"] = request.as_value()["input_digest"].clone();
+    reply["effects"] = json!([{"type":"block","text":"Retry with new arguments"}]);
+    assert!(protocol.check_response(&request, &bytes(&reply)).is_ok());
+    for text in [
+        "".to_owned(),
+        "x".repeat(aw_provider::MAX_MESSAGE_BYTES + 1),
+    ] {
+        reply["effects"][0]["text"] = json!(text);
+        assert!(protocol.check_response(&request, &bytes(&reply)).is_err());
+    }
+    reply["effects"] = json!([{"type":"block","text":"retry","arguments":{"command":"execute"}}]);
+    assert!(protocol.check_response(&request, &bytes(&reply)).is_err());
+}
+
+#[test]
+fn replacement_requires_one_text_payload_and_a_projected_after_result() {
+    let protocol = Protocol::new().unwrap();
+    let mut value = invoke("tool.after", json!(["replace_result"]));
+    value["event"]["tool"]["result_projection"] =
+        json!({"text":"original","status":"success","content_origin":"api_response"});
+    let request = protocol.bind_invocation(value.clone()).unwrap();
+    let mut reply = response();
+    reply["input_digest"] = request.as_value()["input_digest"].clone();
+    reply["effects"] = json!([{"type":"replace_result","text":"compact"}]);
+    assert!(matches!(
+        protocol.check_response(&request, &bytes(&reply)),
+        Ok(Reply::Invocation(_))
+    ));
+    for effects in [
+        json!([{"type":"replace_result"}]),
+        json!([{"type":"replace_result","text":""}]),
+        json!([{"type":"replace_result","text":"x".repeat(aw_provider::MAX_MESSAGE_BYTES + 1)}]),
+        json!([{"type":"observe","text":"hidden"}]),
+        json!([{"type":"replace_result","text":"a"},{"type":"replace_result","text":"b"}]),
+    ] {
+        reply["effects"] = effects;
+        assert!(protocol.check_response(&request, &bytes(&reply)).is_err());
+    }
+    value["event"]["tool"]
+        .as_object_mut()
+        .unwrap()
+        .remove("result_projection");
+    let request = protocol.bind_invocation(value).unwrap();
+    reply["input_digest"] = request.as_value()["input_digest"].clone();
+    reply["effects"] = json!([{"type":"replace_result","text":"compact"}]);
+    assert!(protocol.check_response(&request, &bytes(&reply)).is_err());
+    assert!(protocol
+        .bind_invocation(invoke("tool.before", json!(["replace_result"])))
+        .is_err());
 }

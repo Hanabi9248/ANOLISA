@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,29 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"expected a JSON object: {path}")
     return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    """Publish a complete JSON checkpoint by same-directory atomic replacement."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    created = False
+    try:
+        # Exclusive creation preserves the normal output umask and prevents
+        # concurrent writers in the same process from sharing a staging file.
+        with temporary.open("x", encoding="utf-8") as handle:
+            created = True
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists():
+            temporary.chmod(path.stat().st_mode & 0o777)
+        temporary.replace(path)
+    finally:
+        if created:
+            temporary.unlink(missing_ok=True)
+
 
 
 def sha256(path: Path) -> str | None:
@@ -45,27 +70,23 @@ def observes_mock_server(config_path: Path) -> bool:
 
 
 def command_version(command: list[str]) -> str | None:
-    """Capture the first version line without failing environment collection."""
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, timeout=5, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    text = (result.stdout or result.stderr).strip()
+    """Capture the first successful version line without failing collection."""
+    text = command_output(command)
     return text.splitlines()[0] if text else None
 
 
 def command_output(command: list[str]) -> str | None:
-    """Capture complete command output for structured host metadata."""
+    """Capture successful UTF-8 output; failed optional probes are unavailable."""
     try:
         result = subprocess.run(
-            command, capture_output=True, text=True, timeout=5, check=False
+            command, capture_output=True, timeout=5, check=False
         )
-    except (OSError, subprocess.TimeoutExpired):
+        if result.returncode != 0:
+            return None
+        text = (result.stdout or result.stderr).decode("utf-8")
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
         return None
-    text = (result.stdout or result.stderr).strip()
-    return text or None
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip() or None
 
 
 def frozen_inputs(campaign_path: Path, campaign: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +193,4 @@ def ensure_manifest(
                 "campaign, binary, config, or thresholds changed after freeze"
             )
         return
-    path.write_text(
-        json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    write_json(path, current)

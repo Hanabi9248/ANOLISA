@@ -1,6 +1,8 @@
 //! Frozen v1 outputs plus explicit evidence-completeness regressions.
 
-use asc_capability_pii_scan::{CoverageStatus, PiiScanOptions, PiiScanner, ScanError, Verdict};
+use asc_capability_pii_scan::{
+    CoverageStatus, PiiScanOptions, PiiScanner, SCANNER_VERSION, ScanError, Verdict,
+};
 use serde_json::Value;
 
 #[test]
@@ -17,7 +19,7 @@ fn frozen_v1_builtin_responses_match() {
         let result = scanner
             .scan(case["text"].as_str().unwrap(), &options)
             .unwrap();
-        assert_eq!(result.summary.scanner_version, "2.0.0");
+        assert_eq!(result.summary.scanner_version, "2.1.1");
         assert!(
             result
                 .findings
@@ -38,8 +40,27 @@ fn frozen_v1_builtin_responses_match() {
             actual["summary"].as_object_mut().unwrap().remove(key);
         }
         let mut expected = case["expected"].clone();
-        // Engine provenance is intentionally versioned; all other fields in
-        // this retained V1 corpus must still match. New behavior has its own cases.
+        // Preserve the historical oracle; classify the intentional V2
+        // confidence change instead of regenerating Python outputs.
+        if case["text"] == "sk-test9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA" {
+            assert_eq!(expected["findings"][0]["confidence"], 0.51);
+            expected["findings"][0]["confidence"] = serde_json::json!(0.86);
+        }
+        if case["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("\nid=LTAI5tQnKxExampleToken12")
+        {
+            for (index, kind, old, new) in [
+                (3, "aliyun_access_key_secret", 0.59, 0.94),
+                (4, "aliyun_access_key_id", 0.69, 1.0),
+            ] {
+                assert_eq!(expected["findings"][index]["type"], kind);
+                assert_eq!(expected["findings"][index]["confidence"], old);
+                expected["findings"][index]["confidence"] = serde_json::json!(new);
+            }
+        }
+        // Engine provenance is intentionally versioned; all remaining fields match.
         for finding in expected["findings"].as_array_mut().unwrap() {
             finding["metadata"]["engine"] = serde_json::json!("regex_v2");
         }
@@ -163,4 +184,45 @@ fn mixed_unicode_positions_and_overlapping_credentials_are_redacted() {
     }
     assert!(result.findings.len() >= 2);
     assert!(!result.redacted_text.unwrap().contains("abcdefghijklmnop"));
+}
+
+#[test]
+fn scanner_version_reflects_detection_semantics() {
+    // Whole-word fixture markers change scoring; version both the report and
+    // ruleset digest while retaining the previously added token prefixes.
+    assert_eq!(SCANNER_VERSION, "2.1.1");
+    let report = PiiScanner::new()
+        .unwrap()
+        .scan(
+            "github_pat_11ABCDEFG0abcdefghijabcdefghij1234567890ABCDEFGHIJKL",
+            &PiiScanOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(report.summary.scanner_version, "2.1.1");
+    assert!(report.findings.iter().any(|f| f.pii_type == "api_key"));
+}
+
+#[test]
+fn repeated_embedded_token_prefixes_stay_bounded_and_reach_the_trailing_credential() {
+    // A rejected api_key candidate advances the scan only past its start, so
+    // every embedded github_pat_ prefix re-runs the candidate pattern. The
+    // bounded github_pat_ tail keeps each rescan constant instead of making
+    // the whole remaining word quadratic, and the trailing valid credential
+    // is still reached and reported.
+    let token = format!("sk-{}", "B".repeat(32));
+    let text = format!("x{} {token}", "github_pat_".repeat(32_000));
+    let report = PiiScanner::new()
+        .unwrap()
+        .scan(&text, &PiiScanOptions::default())
+        .unwrap();
+    assert_eq!(report.summary.coverage.status, CoverageStatus::Complete);
+    let start = text.find("sk-").unwrap();
+    let api_keys: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.pii_type == "api_key")
+        .collect();
+    assert_eq!(api_keys.len(), 1);
+    assert_eq!(api_keys[0].span.start, start);
+    assert_eq!(api_keys[0].span.end, start + token.len());
 }

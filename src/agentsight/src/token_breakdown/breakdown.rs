@@ -58,9 +58,16 @@ fn compute_summary(
 /// Builds an events array with:
 /// - "request" event: system_prompt + individual messages in original order
 /// - "response" event (if response data present): content + reasoning_content + tool_calls
+///
+/// `model_name` is the model the caller asked to tokenize for; it is reported
+/// in [`ChatMLTokenBreakdown::model_name`]. It cannot be derived from the
+/// tokenizer, whose own name is the file it was loaded from — every
+/// auto-downloaded tokenizer is `tokenizer.json`, so that reported the literal
+/// string "tokenizer".
 pub fn compute_breakdown(
     doc: &ClassifiedDocument,
     tokenizer: &LlmTokenizer,
+    model_name: &str,
 ) -> Result<ChatMLTokenBreakdown> {
     // === Build request event ===
 
@@ -114,14 +121,24 @@ pub fn compute_breakdown(
         let mut resp_children = Vec::new();
 
         // content
-        let mut content_tokens = 0usize;
-        let mut content_chars = 0usize;
+        //
+        // `resp.content` holds one entry per streamed delta, so the entries
+        // are fragments of one answer, not independent documents. Summing a
+        // count per fragment counts the boundary a tokenizer sees inside a
+        // word split across deltas (`"hel"` + `"lo"` is two tokens where
+        // `"hello"` is one) and overstates the answer. The aggregate must
+        // come from the joined text; the per-item counts stay for display.
+        let content_text: String = resp.content.concat();
+        let content_tokens = if content_text.is_empty() {
+            0
+        } else {
+            tokenizer.count_with_special_tokens(&content_text)?
+        };
+        let content_chars = content_text.chars().count();
         let mut content_items = Vec::new();
         for (idx, text) in resp.content.iter().enumerate() {
             let t = tokenizer.count_with_special_tokens(text)?;
             let c = text.chars().count();
-            content_tokens += t;
-            content_chars += c;
             content_items.push(ResponseItem {
                 index: idx,
                 tokens: t,
@@ -352,7 +369,7 @@ pub fn compute_breakdown(
     top_summary.insert("by_history".to_string(), by_history);
 
     Ok(ChatMLTokenBreakdown {
-        model_name: tokenizer.model_name().to_string(),
+        model_name: model_name.to_string(),
         total_tokens,
         summary: Some(top_summary),
         events,

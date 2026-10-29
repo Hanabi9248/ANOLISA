@@ -250,7 +250,67 @@ pub struct TokenStore {
     table_available: bool,
 }
 
+/// Columns projected by every token reader. A `token_records` table that does
+/// not provide all of them is a foreign or partially created table.
+const REQUIRED_TOKEN_COLUMNS: [&str; 13] = [
+    "id",
+    "timestamp_ns",
+    "pid",
+    "comm",
+    "agent",
+    "model",
+    "provider",
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_tokens",
+    "cache_read_tokens",
+    "request_id",
+    "endpoint",
+];
+
+/// Returns whether `table_name` exists with the schema the readers project.
+///
+/// A same-named table with different columns (another tool's database, or a
+/// partially created table) reports as unavailable so readers return empty
+/// results instead of failing to prepare their fixed column list.
+fn token_table_available(conn: &Connection, table_name: &str) -> Result<bool> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+        [table_name],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+
+    let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let columns: std::collections::HashSet<String> = statement
+        .query_map([table_name], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(REQUIRED_TOKEN_COLUMNS
+        .iter()
+        .all(|column| columns.contains(*column)))
+}
+
 impl TokenStore {
+    /// Delete one expired row while a paced maintenance pass owns the writer.
+    pub(in crate::storage) fn purge_expired_step(&self, cutoff_ns: u64) -> anyhow::Result<usize> {
+        let sql = format!(
+            "DELETE FROM {} WHERE id IN (SELECT id FROM {} WHERE timestamp_ns < ?1 ORDER BY timestamp_ns LIMIT 1)",
+            self.table_name, self.table_name
+        );
+        Ok(self
+            .conn
+            .prepare_cached(&sql)?
+            .execute(params![cutoff_ns.min(i64::MAX as u64) as i64])?)
+    }
+
+    /// Delegate commit-time checkpoints to the registered maintenance worker.
+    pub(in crate::storage) fn use_managed_checkpoints(&self) -> anyhow::Result<()> {
+        agentsight_sqlite_lifecycle::disable_auto_checkpoint(&self.conn)?;
+        Ok(())
+    }
+
     /// Create a new token store with default table name.
     ///
     /// # Errors
@@ -323,13 +383,7 @@ impl TokenStore {
                 ..ConnectionOptions::default()
             },
         )?;
-        let table_available = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
-            )",
-            [table_name],
-            |row| row.get(0),
-        )?;
+        let table_available = token_table_available(&conn, table_name)?;
         Ok(Self {
             conn,
             table_name: table_name.to_string(),
@@ -355,23 +409,21 @@ impl TokenStore {
             self.table_name
         );
         self.conn
-            .execute(
-                &sql,
-                params![
-                    timestamp_ns as i64,
-                    record.pid as i64,
-                    record.comm,
-                    record.agent,
-                    record.model,
-                    record.provider,
-                    record.input_tokens as i64,
-                    record.output_tokens as i64,
-                    record.cache_creation_tokens.map(|v| v as i64),
-                    record.cache_read_tokens.map(|v| v as i64),
-                    record.request_id,
-                    record.endpoint,
-                ],
-            )
+            .prepare_cached(&sql)?
+            .execute(params![
+                timestamp_ns as i64,
+                record.pid as i64,
+                record.comm,
+                record.agent,
+                record.model,
+                record.provider,
+                record.input_tokens as i64,
+                record.output_tokens as i64,
+                record.cache_creation_tokens.map(|v| v as i64),
+                record.cache_read_tokens.map(|v| v as i64),
+                record.request_id,
+                record.endpoint,
+            ])
             .map_err(|e| anyhow::anyhow!("Failed to insert token record: {e}"))?;
 
         Ok(self.conn.last_insert_rowid())
@@ -425,12 +477,14 @@ impl TokenStore {
              FROM {} ORDER BY timestamp_ns DESC",
             self.table_name
         );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .expect("Failed to prepare statement");
+        // The probe above proves the schema only for a stable file; a database
+        // that changes under a read-only handle (or a corrupt schema) still
+        // yields an empty result instead of aborting the process.
+        let Ok(mut stmt) = self.conn.prepare(&sql) else {
+            return Vec::new();
+        };
 
-        stmt.query_map([], |row| {
+        let Ok(rows) = stmt.query_map([], |row| {
             Ok(TokenRecord {
                 id: row.get(0)?,
                 timestamp_ns: row.get::<_, i64>(1)? as u64,
@@ -448,10 +502,10 @@ impl TokenStore {
                 tool_calls: Vec::new(),
                 reasoning_content: None,
             })
-        })
-        .expect("Failed to query")
-        .filter_map(|r| r.ok())
-        .collect()
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     /// Get records in time range
@@ -473,12 +527,12 @@ impl TokenStore {
              ORDER BY timestamp_ns DESC",
             self.table_name
         );
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .expect("Failed to prepare statement");
+        // See `all`: an unrepairable read returns empty rather than aborting.
+        let Ok(mut stmt) = self.conn.prepare(&sql) else {
+            return Vec::new();
+        };
 
-        stmt.query_map(params![start_ns as i64, end_ns as i64], |row| {
+        let Ok(rows) = stmt.query_map(params![start_ns as i64, end_ns as i64], |row| {
             Ok(TokenRecord {
                 id: row.get(0)?,
                 timestamp_ns: row.get::<_, i64>(1)? as u64,
@@ -496,10 +550,10 @@ impl TokenStore {
                 tool_calls: Vec::new(),
                 reasoning_content: None,
             })
-        })
-        .expect("Failed to query")
-        .filter_map(|r| r.ok())
-        .collect()
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     /// Get records for last N hours
@@ -657,23 +711,28 @@ impl<'a> TokenQuery<'a> {
 
     /// Query hours with comparison
     pub fn by_hours_with_compare(&self, hours: u64) -> TokenQueryResult {
-        let mut result = self.by_hours(hours);
+        // Read the clock once and cut both windows from the same instant:
+        // separate `SystemTime::now()` readings for the current and previous
+        // windows could let a record written between them count in both.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let hours_ns = hours.saturating_mul(3_600_000_000_000);
+        let start_ns = now.saturating_sub(hours_ns.saturating_mul(2));
+        let mid_ns = now.saturating_sub(hours_ns);
 
-        // Get previous period data
-        let prev_records = self.store.by_last_hours(hours.saturating_mul(2));
-        let prev_records: Vec<_> = prev_records
+        let mut result = self.build_result(
+            self.store.by_time_range(mid_ns, now),
+            format!("最近 {hours} 小时"),
+        );
+
+        // Previous window: the earlier half, [start_ns, mid_ns)
+        let prev_records: Vec<_> = self
+            .store
+            .by_time_range(start_ns, mid_ns)
             .into_iter()
-            .filter(|r| {
-                // Get records from the earlier half
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
-                let hours_ns = hours.saturating_mul(3_600_000_000_000);
-                let start_ns = now.saturating_sub(hours_ns.saturating_mul(2));
-                let mid_ns = now.saturating_sub(hours_ns);
-                r.timestamp_ns >= start_ns && r.timestamp_ns < mid_ns
-            })
+            .filter(|r| r.timestamp_ns < mid_ns)
             .collect();
 
         let prev_total: u64 = prev_records.iter().map(|r| r.total_tokens()).sum();
@@ -728,24 +787,29 @@ impl<'a> TokenQuery<'a> {
 
         let total_tokens: u64 = records.iter().map(|r| r.total_tokens()).sum();
 
-        // Group by agent name (or comm if no agent)
-        let mut agent_totals: std::collections::HashMap<String, (u64, u64, u64, u64)> =
+        // Group by agent name (or comm if no agent), case-insensitively like
+        // every other agent-attributed view (the genai store's COLLATE NOCASE
+        // filters, `list_agent_names`, the lowercased latency grouping key):
+        // "Agent-A" and "agent-a" are one agent. The lowercase spelling keys
+        // the map; the first original spelling seen labels the group.
+        let mut agent_totals: std::collections::HashMap<String, (String, u64, u64, u64, u64)> =
             std::collections::HashMap::new();
 
         for record in records {
             let name = record.agent.as_ref().unwrap_or(&record.comm).clone();
+            let key = name.to_lowercase();
 
-            let entry = agent_totals.entry(name).or_insert((0, 0, 0, 0));
-            entry.0 += record.total_tokens();
-            entry.1 += record.billed_input_tokens();
-            entry.2 += record.output_tokens;
-            entry.3 += 1;
+            let entry = agent_totals.entry(key).or_insert((name, 0, 0, 0, 0));
+            entry.1 += record.total_tokens();
+            entry.2 += record.billed_input_tokens();
+            entry.3 += record.output_tokens;
+            entry.4 += 1;
         }
 
         // Convert to breakdown
         let mut breakdown: Vec<TokenBreakdown> = agent_totals
             .into_iter()
-            .map(|(name, (total, input, output, count))| {
+            .map(|(_, (name, total, input, output, count))| {
                 let percentage = if total_tokens > 0 {
                     (total as f64 / total_tokens as f64) * 100.0
                 } else {
@@ -763,8 +827,14 @@ impl<'a> TokenQuery<'a> {
             })
             .collect();
 
-        // Sort by total tokens descending
-        breakdown.sort_by_key(|entry| std::cmp::Reverse(entry.total_tokens));
+        // Sort by total tokens descending. The rows come from a HashMap, whose
+        // iteration order is randomized per process, so ties are broken by
+        // name instead of following the map order.
+        breakdown.sort_by(|a, b| {
+            b.total_tokens
+                .cmp(&a.total_tokens)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         breakdown
     }
 }
@@ -805,6 +875,25 @@ mod tests {
         let records = store.all();
         assert!(!records.is_empty());
 
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn read_only_store_treats_a_mismatched_token_table_as_empty() {
+        // A foreign database (or a partially created table) can contain a
+        // `token_records` table with different columns; the read-only CLI path
+        // must report empty results instead of aborting on a failed prepare.
+        let path = unique_db_path("mismatched_table");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE token_records (x INTEGER)", [])
+                .unwrap();
+        }
+
+        let store = TokenStore::open_read_only_existing(&path, "token_records").unwrap();
+
+        assert!(store.by_time_range(0, 1_000_000).is_empty());
+        assert!(store.all().is_empty());
         cleanup_db(&path);
     }
 
@@ -1216,6 +1305,38 @@ mod tests {
     }
 
     #[test]
+    fn test_breakdown_merges_case_variant_agents() {
+        // The genai store merges agent-name case variants everywhere (COLLATE
+        // NOCASE filters, list_agent_names, the lowercased latency grouping
+        // key); the token breakdown is the one agent-attributed view still
+        // grouping on the raw spelling, so "Agent-A" and "agent-a" showed as
+        // two rows and split the same agent's tokens across both.
+        let path = unique_db_path("breakdown_case_variants");
+        let store = TokenStore::new(&path).unwrap();
+        let (start, _) = TimePeriod::Today.time_range();
+        for (i, agent) in ["Agent-A", "agent-a"].iter().enumerate() {
+            let ts = start + (i as u64) * 1_000_000_000;
+            store.insert(&make_record(ts, Some(agent), 40, 20)).unwrap();
+        }
+
+        let result = TokenQuery::new(&store).by_period_with_breakdown(TimePeriod::Today);
+        assert_eq!(
+            result.breakdown.len(),
+            1,
+            "case variants must merge into one breakdown row, got {:?}",
+            result
+                .breakdown
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(result.breakdown[0].total_tokens, 120);
+        assert_eq!(result.breakdown[0].request_count, 2);
+        assert_eq!(result.breakdown[0].percentage, 100.0);
+        cleanup_db(&path);
+    }
+
+    #[test]
     fn test_today_includes_record_in_final_second() {
         // Today ends at the same fixed 23:59:59 as yesterday, so it needs the
         // same nanosecond extension; without it 23:59:59.5 falls outside the
@@ -1284,6 +1405,34 @@ mod tests {
         let comparison = result.comparison.expect("today compares against yesterday");
         assert_eq!(comparison.previous_total, 100);
         assert_eq!(comparison.trend, Trend::Down);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn test_breakdown_ties_are_ordered_by_name() {
+        let path = unique_db_path("breakdown_ties");
+        let store = TokenStore::new(&path).unwrap();
+        let (today_start, _) = TimePeriod::Today.time_range();
+
+        // Five agents with identical totals: the breakdown order used to
+        // follow the HashMap iteration order (randomized per process).
+        for agent in ["zeta", "alpha", "delta", "echo", "bravo"] {
+            store
+                .insert(&make_record(today_start, Some(agent), 100, 50))
+                .unwrap();
+        }
+
+        let result = TokenQuery::new(&store).by_period_with_breakdown(TimePeriod::Today);
+        let names: Vec<&str> = result
+            .breakdown
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha", "bravo", "delta", "echo", "zeta"],
+            "count ties must be broken by name, not by map order"
+        );
         cleanup_db(&path);
     }
 }

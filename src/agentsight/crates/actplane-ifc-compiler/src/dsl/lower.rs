@@ -105,7 +105,17 @@ fn lower_exec(pat: &str) -> (u8, String) {
     }
     let base = pat.rsplit('/').next().unwrap_or(pat);
     if let Some(stripped) = base.strip_suffix('*') {
-        (M_PREFIX, stripped.to_string())
+        // Only the basename reaches the exec matcher, which compares it with
+        // the process's comm, so a wildcard basename names the wildcard
+        // itself: `dir/*` and `dir/**` mean "any comm", and `git**` means the
+        // same as `git*`. Leaving the stars in the literal — or returning an
+        // empty one — installs a rule that can never fire, because
+        // `taint_prefix` needs a non-empty needle and no comm contains `*`.
+        let literal = stripped.trim_end_matches('*');
+        if literal.is_empty() {
+            return (M_ANY, String::new());
+        }
+        (M_PREFIX, literal.to_string())
     } else {
         (M_EXACT, base.to_string())
     }
@@ -129,7 +139,14 @@ fn shorten_contains_literal(lit: &str) -> String {
     if !last.is_empty() && last.len() <= MAX_CONTAINS_LITERAL {
         return last.to_string();
     }
-    let start = trimmed.len().saturating_sub(MAX_CONTAINS_LITERAL);
+    // Cut at a character boundary: the literal comes from a parsed policy
+    // string and may contain multi-byte UTF-8, so a raw byte index can land
+    // inside a character and panic. Moving forward only shortens the
+    // returned suffix, keeping it within the byte budget.
+    let mut start = trimmed.len() - MAX_CONTAINS_LITERAL;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
     trimmed[start..].to_string()
 }
 
@@ -235,12 +252,35 @@ fn absolute_path_discards_after_star(pat: &str, lowered: &(u8, String)) -> bool 
     let Some(idx) = pat.find('*') else {
         return false;
     };
-    pat[idx + 1..].contains('/') && lowered.0 == M_PREFIX && lowered.1 == pat[..idx]
+    // Everything after the first `*` is dropped when the lowered matcher is a
+    // prefix on the part before it, so the widening warning must fire whenever
+    // the dropped tail carries substance — not only when a `/` follows the
+    // star. `/tmp/*secret` drops "secret" and `/*secret` drops "secret" while
+    // lowering to the prefix "/", which matches every absolute path. A pure
+    // trailing glob (`/tmp/**`, `/tmp/*`) drops only stars (or nothing) and
+    // stays warning-free.
+    !pat[idx + 1..].trim_matches('*').is_empty() && lowered.0 == M_PREFIX && lowered.1 == pat[..idx]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_literal_truncation_is_char_boundary_safe() {
+        // 6 CJK chars = 18 bytes, no '/', so the last-16-byte cut (start = 2)
+        // landed inside the first character and panicked.
+        let lowered = lower_path("数据数据数据数据数据数据");
+        assert_eq!(lowered.0, M_CONTAINS);
+        assert!(lowered.1.len() <= MAX_CONTAINS_LITERAL);
+        assert!(lowered.1.is_char_boundary(0));
+
+        // The same through the public compiler entry point.
+        let src =
+            "rule r:\n  block write file \"数据数据数据数据数据数据\" if true\n  because \"x\"\n";
+        let compiled = crate::dsl::compile_str(src).expect("policy must compile");
+        assert!(!compiled.bytes.is_empty());
+    }
 
     #[test]
     fn repo_relative_paths_match_absolute_runtime_paths() {
@@ -346,6 +386,68 @@ mod tests {
     }
 
     #[test]
+    fn absolute_star_suffix_without_slash_widens_with_warning() {
+        // `/*secret` and `/tmp/*secret` discard everything after the first `*`
+        // (the lowered matcher is a prefix on "/" resp. "/tmp/"), so every
+        // absolute path under the prefix matches — wider than the authored
+        // glob. The widening check used to fire only when a `/` followed the
+        // star, which missed this (wider) no-slash case entirely: a
+        // `block write file "/*secret"` clause silently installs a block on
+        // every absolute path.
+        let pol = crate::dsl::parse::parse(
+            r#"
+            rule r:
+              block write file "/*secret" if true
+              because "x"
+            rule r2:
+              block write file "/tmp/*secret" if true
+              because "x""#,
+        )
+        .expect("parse");
+        let c = compile(&pol).expect("compile");
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("'/*secret'") && w.contains("wider")),
+            "root single-star pattern must produce a compile warning: {:?}",
+            c.warnings
+        );
+        assert!(
+            c.warnings.iter().any(|w| w.contains("'/tmp/*secret'")),
+            "a mid-star pattern without a slash after the star must warn like /tmp/*/secret does: {:?}",
+            c.warnings
+        );
+        // Pin the lowered matcher: still a PREFIX on the part before the star.
+        let cfg: CConfig = unsafe { std::ptr::read_unaligned(c.bytes.as_ptr() as *const CConfig) };
+        assert_eq!(cfg.n_rules, 2);
+        assert_eq!(cfg.rules[0].m, M_PREFIX);
+        let lit = cfg.rules[0].target.split(|b| *b == 0).next().unwrap_or(&[]);
+        assert_eq!(lit, b"/");
+    }
+
+    #[test]
+    fn absolute_trailing_star_globs_stay_warning_free() {
+        // "/tmp/**" discards only the trailing glob stars and "/tmp/*"
+        // discards nothing after the star: neither may warn.
+        let pol = crate::dsl::parse::parse(
+            r#"
+            rule r:
+              block write file "/tmp/**" if true
+              because "x"
+            rule r2:
+              block write file "/tmp/*" if true
+              because "x""#,
+        )
+        .expect("parse");
+        let c = compile(&pol).expect("compile");
+        assert!(
+            c.warnings.is_empty(),
+            "trailing-star globs must not warn: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
     fn absolute_trailing_star_and_relative_mid_star_do_not_warn() {
         let pol = crate::dsl::parse::parse(
             r#"
@@ -370,6 +472,26 @@ mod tests {
         assert_eq!(lower_exec("*"), (M_ANY, String::new()));
         assert_eq!(lower_exec("**"), (M_ANY, String::new()));
         assert_eq!(lower_exec("**/*"), (M_ANY, String::new()));
+    }
+
+    #[test]
+    fn exec_directory_wildcard_matches_any_comm() {
+        // Only the basename reaches the exec matcher, which compares it against
+        // the process's comm, so `dir/*` wildcards the basename itself. It used
+        // to lower to an empty prefix literal, and `taint_prefix` never matches
+        // an empty needle (`test_taint.c`: "prefix: empty never matches"), so
+        // `block exec "/usr/bin/*" if AGENT` installed a rule that could never
+        // fire — no denial, no violation, no warning.
+        assert_eq!(lower_exec("/usr/bin/*"), (M_ANY, String::new()));
+        assert_eq!(lower_exec("dir/*"), (M_ANY, String::new()));
+        assert_eq!(lower_exec("**/sub/*"), (M_ANY, String::new()));
+        // A star-only prefix must not survive in the literal either: no comm
+        // contains `*`, so `M_PREFIX` on "git*" is as dead as an empty one.
+        assert_eq!(lower_exec("/usr/bin/**"), (M_ANY, String::new()));
+        assert_eq!(lower_exec("git**"), (M_PREFIX, "git".to_string()));
+        // A directory plus a real basename still narrows to the basename.
+        assert_eq!(lower_exec("/usr/bin/git*"), (M_PREFIX, "git".to_string()));
+        assert_eq!(lower_exec("/usr/bin/git"), (M_EXACT, "git".to_string()));
     }
 
     #[test]
@@ -1415,16 +1537,16 @@ pub fn compile_with_labels(
     }
     for rule in &pol.rules {
         for cl in &rule.clauses {
-            if let Some(arg) = &cl.target.arg {
-                if arg.len() >= ARG {
-                    return Err(format!(
-                        "rule '{}': exec argument is {} bytes, exceeds the {} byte ABI limit (ARG={})",
-                        rule.name,
-                        arg.len(),
-                        ARG - 1,
-                        ARG
-                    ));
-                }
+            if let Some(arg) = &cl.target.arg
+                && arg.len() >= ARG
+            {
+                return Err(format!(
+                    "rule '{}': exec argument is {} bytes, exceeds the {} byte ABI limit (ARG={})",
+                    rule.name,
+                    arg.len(),
+                    ARG - 1,
+                    ARG
+                ));
             }
             for op in op_lowers(cl.op)? {
                 let op = *op;

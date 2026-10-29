@@ -8,7 +8,18 @@ use std::collections::HashMap;
 
 /// Parse JSONL content into JSON events; blank/malformed lines are skipped
 /// with a warning so one bad line never poisons a whole session.
+///
+/// One leading UTF-8 BOM (U+FEFF) is an encoding artifact, not data: tooling
+/// that saves a file as "UTF-8 with BOM" prefixes it with the mark — a session
+/// directory copied or re-saved across a Windows/WSL mount reaches the
+/// collector that way — and `serde_json` rejects the mark at offset 0, so the
+/// FIRST record was processed as malformed while every later line parsed. For
+/// a Codex rollout that record is `session_meta`, the sole source of the
+/// session cwd (the project column), the CLI version and the session id. The
+/// config and SSE readers already treat exactly one leading mark as the
+/// format's: a second one is data and still fails the parse.
 pub fn load_jsonl_events(content: &str) -> Vec<serde_json::Value> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut events = Vec::new();
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -36,6 +47,7 @@ pub fn extract_private_metadata(
     let mut cwd: Option<String> = None;
     let mut user_count: u64 = 0;
     let mut assistant_count: u64 = 0;
+    let mut in_assistant_turn = false;
 
     for e in events {
         if cwd.is_none() {
@@ -45,12 +57,26 @@ pub fn extract_private_metadata(
             // Claude-style tool results also ride in type=="user" events;
             // they are observations, not user messages.
             Some("user") => {
+                in_assistant_turn = false;
                 if !carries_only_tool_results(e.get("message")) {
                     user_count += 1;
                 }
             }
-            Some("assistant") => assistant_count += 1,
-            _ => {}
+            // The ATIF converter merges consecutive assistant events into a
+            // single Agent step ("Collect all consecutive assistant events
+            // (same LLM turn)"), so count turns rather than events: the count
+            // has to describe the trajectory it rides on, as the user side
+            // does since 9df75a971.
+            Some("assistant") => {
+                if !in_assistant_turn {
+                    assistant_count += 1;
+                    in_assistant_turn = true;
+                }
+            }
+            // A skipped event neither extends nor ends the turn, mirroring the
+            // converter's merge loop.
+            Some(t) if crate::atif::SKIP_TYPES.contains(&t) => {}
+            _ => in_assistant_turn = false,
         }
     }
 
@@ -107,6 +133,24 @@ mod tests {
     }
 
     #[test]
+    fn test_load_jsonl_reads_one_leading_bom() {
+        // A session file copied or re-saved through Windows tooling can carry
+        // UTF-8's byte-order mark. The mark is neither whitespace nor data the
+        // JSONL format defines, so it used to fail the parse on the FIRST line
+        // only: for a Codex rollout that line is `session_meta`, the sole
+        // source of cwd, cli version and session id.
+        let content = "\u{feff}{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n";
+        let events = load_jsonl_events(content);
+        assert_eq!(events.len(), 2, "the marked first record must parse");
+        assert_eq!(events[0]["type"], "user");
+        // Only the first mark is the format's: a second one is data.
+        assert!(
+            load_jsonl_events("\u{feff}\u{feff}{\"type\":\"user\"}\n").is_empty(),
+            "a second mark is data and still fails the parse"
+        );
+    }
+
+    #[test]
     fn test_extract_private_metadata() {
         let content = concat!(
             "{\"type\":\"runtime-config\",\"sessionId\":\"abc\",\"model\":\"qwen-max\"}\n",
@@ -119,6 +163,33 @@ mod tests {
         assert_eq!(extra["user_message_count"], 1);
         assert_eq!(extra["assistant_message_count"], 1);
         assert_eq!(extra["project"], "myapp");
+    }
+
+    #[test]
+    fn test_extract_private_metadata_counts_assistant_turns_like_the_trajectory() {
+        use agentsight_atif::StepSource;
+        // The converter merges consecutive assistant events into one Agent
+        // step ("same LLM turn"), so the count that rides in `extra` must
+        // describe the trajectory rather than the raw event stream — the same
+        // contract the user side follows since 9df75a971.
+        let content = concat!(
+            "{\"type\":\"user\",\"cwd\":\"/data/myapp\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"part one\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"part two\"}]}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let trajectory = crate::atif::convert_qoder_events(&events, "qoder").unwrap();
+        let agent_steps = trajectory
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::Agent)
+            .count();
+        let extra = extract_private_metadata(&events, "myapp");
+        assert_eq!(agent_steps, 1, "both assistant events are one LLM turn");
+        assert_eq!(
+            extra["assistant_message_count"], agent_steps as i64,
+            "the count must describe the trajectory it rides on"
+        );
     }
 
     #[test]

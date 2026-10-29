@@ -51,7 +51,23 @@ class OtelEnvironment:
     def start(self, authorize=True, stderr=None, **env):
         self.socket = self.directory / "daemon.sock"
         self.log = (self.directory / "daemon.log").open("w+")
-        command = [self.binaries["agent-sec-daemon"], "--socket", str(self.socket)]
+        config = self.directory / "skillsec.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "stateDir": str(self.directory / "skillsec-state"),
+                    "enableDefaultSkillDirs": False,
+                }
+            )
+        )
+        config.chmod(0o600)
+        command = [
+            self.binaries["agent-sec-daemon"],
+            "--socket",
+            str(self.socket),
+            "--skillsec-config",
+            str(config),
+        ]
         if authorize:
             command.extend(["--policy-admin-uid", str(os.getuid())])
         self.daemon = subprocess.Popen(
@@ -240,7 +256,18 @@ def test_schema_and_frame_budgets_are_independent(otel):
             "method": "policy.templates.create",
             "params": {
                 "policyName": "must-not-exist",
-                "template": {"kind": "prevent_file_deletion", "files": ["/example"]},
+                "template": {
+                    "specVersion": "0.1",
+                    "rules": [
+                        {
+                            "effect": "block",
+                            "category": "file",
+                            "action": "write",
+                            "target": {"type": "file", "path": "/example"},
+                            "where": {"operation": {"eq": "delete"}},
+                        }
+                    ],
+                },
             },
             "traceContext": {"version": 2},
         }
@@ -325,6 +352,9 @@ def test_same_trace_requests_keep_distinct_unsampled_log_anchors(otel):
     requests = {}
     for record in otel.records():
         fields = record["fields"]
+        # Process startup and maintenance records have no request context.
+        if fields["reason"] in {"startup_stage", "retention_stage"}:
+            continue
         correlation = json.loads(fields["correlation"])
         assert correlation["trace_id"] == TRACE
         assert correlation["span_id"] == correlation["request_span_id"]

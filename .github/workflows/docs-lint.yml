@@ -2,8 +2,8 @@
 # Docs Lint — documentation-standard.md enforcement
 #
 # Jobs:
-#   docs-lint — bilingual naming convention + en/zh user-guide tree parity
-#               + relative link integrity for docs/ and README files
+#   docs-lint — bilingual naming convention + en/zh guide tree parity
+#               + relative link integrity for guides and source entry points
 ###############################################################################
 
 name: CI / Docs
@@ -18,6 +18,7 @@ on:
       - '.github/docs-lint-exemptions.txt'
       - 'scripts/docs-link-check.py'
       - 'tests/test_docs_link_references.py'
+      - 'scripts/test_docs_link_check.py'
       - '.github/workflows/docs-lint.yml'
 
 permissions:
@@ -37,4 +38,6 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_docs_link_references.py'
 
       - name: Relative link check
-        run: python3 scripts/docs-link-check.py
+        run: |
+          python3 -m unittest discover -s scripts -p test_docs_link_check.py
+          python3 scripts/docs-link-check.py

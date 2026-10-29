@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import sys
 from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
@@ -19,8 +20,27 @@ import campaign_evidence
 
 def read_json(path: Path) -> dict[str, Any]:
     """Read one JSON object."""
-    value = json.loads(path.read_text(encoding="utf-8"))
-    return value if isinstance(value, dict) else {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("expected a JSON object")
+        return value
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"Cannot read campaign artifact {path}: {error}", file=sys.stderr)
+        return {"_artifact_error": str(path)}
+
+
+def _artifact_number(value: Any) -> float | None:
+    """Read an int/float artifact field, or None for anything else.
+
+    campaign_evidence.finite_float rejects integers too large for float
+    (a corrupted counter in a metrics artifact raises OverflowError from
+    float() and math.isfinite()) and non-finite values, so one outlier
+    reads as missing instead of crashing the whole report.
+    """
+    if not isinstance(value, (int, float)):
+        return None
+    return campaign_evidence.finite_float(value)
 
 
 def nested(value: dict[str, Any], *keys: str) -> float | bool | None:
@@ -32,9 +52,7 @@ def nested(value: dict[str, Any], *keys: str) -> float | bool | None:
         current = current.get(key)
     if isinstance(current, bool):
         return current
-    if isinstance(current, (int, float)) and math.isfinite(current):
-        return float(current)
-    return None
+    return _artifact_number(current)
 
 
 def display(value: Any, suffix: str = "") -> str:
@@ -81,12 +99,58 @@ def discover(results: Path) -> list[tuple[Path, dict[str, Any]]]:
     ]
 
 
+def write_run_inventory(
+    results: Path, items: list[tuple[Path, dict[str, Any]]]
+) -> None:
+    """Export every discovered formal run without modifying source evidence."""
+    fields = (
+        "scenario",
+        "version",
+        "label",
+        "repetition",
+        "qps",
+        "duration_seconds",
+        "harness_exit_code",
+        "verdict",
+        "missing_gates",
+        "failed_gates",
+        "result_path",
+    )
+    with (results / "run-inventory.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for path, run in sorted(
+            items, key=lambda item: item[0].relative_to(results).as_posix()
+        ):
+            evaluation = run.get("evaluation") or {}
+            row = {field: run.get(field, "") for field in fields[:7]}
+            row.update(
+                verdict=evaluation.get("verdict", ""),
+                missing_gates=json.dumps(
+                    evaluation.get("missing", []), ensure_ascii=False
+                ),
+                failed_gates=json.dumps(
+                    evaluation.get("failed", []), ensure_ascii=False
+                ),
+                result_path=path.relative_to(results).as_posix(),
+            )
+            writer.writerow(row)
+
+
 def matrix_rows(items: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
     """Aggregate matrix repetitions by absolute QPS and version."""
     grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
     for _, run in items:
         if run.get("scenario") == "matrix":
-            grouped[(int(run["qps"]), run["version"])].append(run)
+            try:
+                qps = int(run["qps"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                # Keep the record in the inventory and final audit, but do not
+                # invent a load level for unusable evidence in comparisons.
+                continue
+            grouped[(qps, run["version"])].append(run)
     rows = []
     for (qps, version), runs in sorted(grouped.items()):
         row: dict[str, Any] = {
@@ -333,29 +397,65 @@ def write_recovery(
         "| --- | ---: | ---: | ---: | ---: | --- |",
     ]
     outcomes: dict[tuple[str, int], dict[str, Any]] = {}
+    diagnostics = []
     for (version, repetition), phases in sorted(grouped.items()):
-        overload = phases.get("overload")
-        recover = phases.get("recover")
+        overload = (
+            campaign_evidence.summary_of_phase(phases, "overload")
+            if "overload" in phases
+            else {}
+        )
+        recover = (
+            campaign_evidence.summary_of_phase(phases, "recover")
+            if "recover" in phases
+            else {}
+        )
         outcome = campaign_evidence.recovery_outcome(phases, settings, thresholds)
         outcomes[(version, repetition)] = outcome
+        if outcome["missing"]:
+            diagnostics.append(
+                f"- {version}/{repetition}: unproven recovery gates: "
+                + ", ".join(outcome["missing"])
+            )
         seconds = outcome["seconds"]
         lines.append(
             f"| {version}/{repetition} | "
-            f"{display(nested(overload[1]['summary'], 'resources', 'rss_mb', 'max') if overload else None, ' MB')} | "
+            f"{display(nested(overload, 'resources', 'rss_mb', 'max'), ' MB')} | "
             f"{display(seconds.get('effective_qps'), 's')}/"
             f"{display(seconds.get('latency_p99_ms'), 's')}/"
             f"{display(seconds.get('rss_mb'), 's')} | "
             f"{display(seconds.get('channel_length'), 's')}/"
             f"{display(seconds.get('connection_cache_bytes'), 's')} | "
-            f"{ratio_display(nested(recover[1]['summary'], 'trace_completeness') if recover else None)} | "
+            f"{ratio_display(nested(recover, 'trace_completeness'))} | "
             f"{outcome['verdict']} |"
         )
     if not grouped:
         lines.append("| — | — | — | — | — | NOT EXECUTED |")
+    if diagnostics:
+        lines.extend(["", *diagnostics])
     (results / "recovery-report.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
     return outcomes
+
+
+def fault_case_total(entry: object) -> int | None:
+    """Total repetitions of one fault case, when its counters are usable.
+
+    Mirrors the verdict-side classification in
+    ``campaign_evidence.fault_outcome``: a case entry must be an object of
+    non-negative integer counters, and booleans are not counts. Anything
+    else is unusable evidence and renders as a placeholder instead of
+    raising on the collector's own output.
+    """
+    if not isinstance(entry, dict):
+        return None
+    counters = entry.values()
+    if not all(
+        isinstance(count, int) and not isinstance(count, bool) and count >= 0
+        for count in counters
+    ):
+        return None
+    return sum(counters)
 
 
 def write_fault(
@@ -380,11 +480,18 @@ def write_fault(
         found = True
         fault = read_json(path)
         outcome = campaign_evidence.fault_outcome(run_path, run, settings, thresholds)
-        results_by_version[run["version"]] = outcome
+        # The verdict above already tolerates unusable artifact shapes; the
+        # table must too: `outcomes` entries that are not counter objects
+        # render a placeholder instead of raising.
+        version = str(run.get("version", "?"))
+        results_by_version[version] = outcome
         summary = run.get("summary", {})
-        for name, outcomes in fault.get("outcomes", {}).items():
+        outcomes = fault.get("outcomes")
+        outcomes = outcomes if isinstance(outcomes, dict) else {}
+        for name, entry in outcomes.items():
+            total = fault_case_total(entry)
             lines.append(
-                f"| {run['version']} | {name} | {sum(outcomes.values())} | "
+                f"| {version} | {name} | {total if total is not None else '—'} | "
                 f"{fault.get('server_healthy_after')} | {fault.get('process_alive_after')} | "
                 f"{ratio_display(nested(summary, 'http_success_rate'))}/"
                 f"{ratio_display(nested(summary, 'trace_completeness'))} | "
@@ -401,6 +508,7 @@ def write_regression(results: Path) -> dict[str, Any]:
     path = results / "regression.json"
     regression = read_json(path) if path.exists() else {}
     checks = regression.get("checks", [])
+    checks = checks if isinstance(checks, list) else []
     lines = [
         "# AgentSight 回归测试报告",
         "",
@@ -408,9 +516,17 @@ def write_regression(results: Path) -> dict[str, Any]:
         "| --- | ---: | --- |",
     ]
     for check in checks:
+        # A check that is not an object of a string command and an integer
+        # exit code is unusable evidence: render a placeholder row instead
+        # of raising and losing every other check in the report.
+        if not campaign_evidence.usable_regression_check(check):
+            lines.append("| — | — | — |")
+            continue
+        command = check["command"]
+        exit_code = check["exit_code"]
         lines.append(
-            f"| `{check['command']}` | {check['exit_code']} | "
-            f"{'PASS' if check['exit_code'] == 0 else 'FAIL'} |"
+            f"| `{command}` | {exit_code} | "
+            f"{'PASS' if exit_code == 0 else 'FAIL'} |"
         )
     if not checks:
         lines.append("| — | — | NOT EXECUTED |")
@@ -451,11 +567,9 @@ def comparison_summary(
     def values(field: str) -> tuple[float | None, float | None]:
         if before is None or after is None:
             return None, None
-        baseline = before.get(field)
-        optimized = after.get(field)
         return (
-            float(baseline) if isinstance(baseline, (int, float)) else None,
-            float(optimized) if isinstance(optimized, (int, float)) else None,
+            _artifact_number(before.get(field)),
+            _artifact_number(after.get(field)),
         )
 
     def regular_metric(field: str) -> dict[str, float | None]:
@@ -470,16 +584,8 @@ def comparison_summary(
     drop_baseline, drop_optimized = values("drop_rate")
     capacity_baseline = capacities.get("baseline", {}).get("maximum_sustainable_qps")
     capacity_optimized = capacities.get("optimized", {}).get("maximum_sustainable_qps")
-    capacity_before = (
-        float(capacity_baseline)
-        if isinstance(capacity_baseline, (int, float))
-        else None
-    )
-    capacity_after = (
-        float(capacity_optimized)
-        if isinstance(capacity_optimized, (int, float))
-        else None
-    )
+    capacity_before = _artifact_number(capacity_baseline)
+    capacity_after = _artifact_number(capacity_optimized)
     soak_slopes: dict[str, float | None] = {}
     for version in ("baseline", "optimized"):
         runs = [
@@ -545,13 +651,15 @@ def change_conclusion(
 
 
 def headline_lines(
-    comparison: dict[str, Any], *, aa_calibration: bool = False
+    comparison: dict[str, Any], *, aa_calibration: bool = False, claims_allowed: bool = True
 ) -> list[str]:
     """Render the approved human-readable improvement summary."""
 
     def conclusion(delta: float | None, subject: str, *, lower_is_better: bool) -> str:
         if aa_calibration:
             return "A/A 测量波动" if delta is not None else "证据不足"
+        if not claims_allowed:
+            return "证据不足"
         return change_conclusion(delta, subject, lower_is_better=lower_is_better)
 
     highest = comparison["highest_common_qps"]
@@ -667,8 +775,10 @@ def write_final(
     issues = campaign_evidence.audit_campaign(
         campaign_data, items, capacities, recovery, faults, regression
     )
-    complete = not issues
     manifest = read_json(results / "manifest.json")
+    if manifest.get("_artifact_error"):
+        issues.append("manifest could not be read; frozen inputs are unverified")
+    complete = not issues
     host = manifest.get("host", {})
     frozen = manifest.get("frozen", {})
     frozen_versions = frozen.get("versions", {})
@@ -709,10 +819,11 @@ def write_final(
             f"`{frozen.get('config_sha256') or '—'}` |"
         )
     regression_checks = regression.get("checks", [])
+    regression_checks = regression_checks if isinstance(regression_checks, list) else []
     regression_passed = sum(
-        check.get("exit_code") == 0
+        check["exit_code"] == 0
         for check in regression_checks
-        if isinstance(check, dict)
+        if campaign_evidence.usable_regression_check(check)
     )
     lines = [
         (
@@ -726,8 +837,7 @@ def write_final(
         f"**总判定：{'PASS' if complete else 'INCONCLUSIVE'}**",
         "",
         (
-            "**测试类型：A/A 测量稳定性校准。所有差值均视为测量波动，"
-            "不得用于声明优化效果。**"
+            "**测试类型：A/A 测量稳定性校准。所有差值均视为测量波动，" "不得用于声明优化效果。**"
             if aa_calibration
             else "**测试类型：A/B 优化前后对比。**"
         ),
@@ -740,7 +850,7 @@ def write_final(
         "",
         "### 核心波动摘要" if aa_calibration else "### 核心改进摘要",
         "",
-        *headline_lines(comparison, aa_calibration=aa_calibration),
+        *headline_lines(comparison, aa_calibration=aa_calibration, claims_allowed=complete),
         "",
         (
             "> A/A 模式中 baseline 和 optimized 来自同一版本，表中变化用于"
@@ -832,7 +942,7 @@ def write_final(
         "schema_version": 1,
         "verdict": "PASS" if complete else "INCONCLUSIVE",
         "comparison_mode": comparison_mode,
-        "optimization_claim_allowed": not aa_calibration,
+        "optimization_claim_allowed": complete and not aa_calibration,
         "issues": issues,
         "comparison": comparison,
     }
@@ -850,6 +960,7 @@ def main() -> int:
     campaign_data = campaign.read_json(args.campaign)
     campaign.validate_campaign(campaign_data)
     items = discover(args.results)
+    write_run_inventory(args.results, items)
     rows = matrix_rows(items)
     write_performance(args.results, rows)
     capacities = write_capacity(args.results)

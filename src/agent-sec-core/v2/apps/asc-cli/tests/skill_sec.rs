@@ -9,8 +9,7 @@ use asc_daemon_core::RootManagedPrincipalPolicy;
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_daemon_service::ShutdownToken;
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
-use asc_policy_engine::PolicyTemplateCompiler;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_security_events::SecurityEvent;
 use serde_json::{Value, json};
 use std::fs;
@@ -32,7 +31,7 @@ async fn invoke(socket: &Path, arguments: &[&str]) -> (i32, Value, String) {
     let mut args: Vec<std::ffi::OsString> = vec![
         "--socket".into(),
         socket.as_os_str().into(),
-        "skill-ledger".into(),
+        "skillsec".into(),
     ];
     args.extend(arguments.iter().map(Into::into));
     let output = tokio::task::spawn_blocking(move || common::run(&args))
@@ -68,6 +67,7 @@ async fn cli_runs_full_core_workflow_and_emits_safe_public_audit() {
     let service = Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state.clone(),
                 managed_skill_dirs: vec![
                     asc_capability_skill_sec::ManagedSkillDir::new(&skill).unwrap(),
@@ -84,10 +84,7 @@ async fn cli_runs_full_core_workflow_and_emits_safe_public_audit() {
     let events = Arc::new(Events::default());
     let finalizer = asc_action_runtime::testing::audit_finalizer(events.clone());
     let dispatcher = Arc::new(DaemonDispatcher::new(
-        PapService::new(
-            Arc::new(ProcessLocalPapRepository::default()),
-            Arc::new(PolicyTemplateCompiler),
-        ),
+        PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap())),
         Arc::new(RootManagedPrincipalPolicy::default()),
         asc_daemon::skill_application(
             finalizer,
@@ -151,12 +148,9 @@ fn assert_public_audit(events: &Events) {
         "decide",
         "list-scanners",
     ];
-    if rustix::process::geteuid().as_raw() == 0 {
-        expected.extend(["rotate-keys", "check", "scan"]);
-    }
     expected.push("activate");
     if rustix::process::geteuid().as_raw() == 0 {
-        expected.extend(["check", "rotate-keys", "export", "scan", "decide"]);
+        expected.extend(["check", "export", "scan", "decide"]);
     }
     expected.push("status");
     // Each accepted RPC finalizes once; local CLI validation emits no daemon event.
@@ -292,13 +286,13 @@ async fn assert_decision_and_export_contract(socket: &Path, path: &str, director
 }
 
 async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Path) {
-    if rustix::process::geteuid().as_raw() == 0 {
-        assert_eq!(invoke(socket, &["rotate-keys"]).await.0, 0);
-        assert_eq!(
-            invoke(socket, &["check", path]).await.1["status"],
-            "tampered"
-        );
-        assert_eq!(invoke(socket, &["scan", path]).await.0, 0);
+    for arguments in [
+        vec!["rotate-keys"],
+        vec!["init", "--force-keys", "--no-baseline"],
+    ] {
+        let (code, _, error) = invoke(socket, &arguments).await;
+        assert_eq!(code, 1);
+        assert!(error.contains("not supported"), "{error}");
     }
     assert_eq!(invoke(socket, &["activate", path]).await.0, 0);
     if rustix::process::geteuid().as_raw() == 0 {
@@ -315,13 +309,13 @@ async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Pa
             vec!["rotate-keys"],
             vec!["export", path, "--output", export_parent.to_str().unwrap()],
         ] {
-            let expected = i32::from(arguments[0] == "rotate-keys");
+            let expected = i32::from(arguments[0] != "export");
             let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-sec-cli"))
                 .arg("--socket")
                 .arg(socket)
                 .arg("--timeout-ms")
                 .arg("5000")
-                .arg("skill-ledger")
+                .arg("skillsec")
                 .args(&arguments)
                 .uid(1001)
                 .gid(1001)
@@ -330,12 +324,22 @@ async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Pa
             assert_eq!(
                 output.status.code(),
                 Some(expected),
-                "{:?}: {}",
+                "{:?}: stdout={} stderr={}",
                 arguments,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if arguments[0] == "check" {
+                let checked: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(checked["status"], "deny");
+                assert!(
+                    checked["findings"]
+                        .to_string()
+                        .contains("PRIVATE_FINDING_MARKER")
+                );
+            }
             if arguments[0] == "rotate-keys" {
-                assert!(String::from_utf8_lossy(&output.stderr).contains("root administrator"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("not supported"));
             }
         }
         assert_user_can_edit_after_rollback(socket, directory).await;
@@ -375,7 +379,7 @@ async fn assert_user_can_edit_after_rollback(socket: &Path, directory: &Path) {
         .arg("--socket")
         .arg(socket)
         .args([
-            "skill-ledger",
+            "skillsec",
             "decide",
             skill.to_str().unwrap(),
             "--action",
@@ -412,11 +416,15 @@ async fn assert_user_can_edit_after_rollback(socket: &Path, directory: &Path) {
 
 #[test]
 fn certify_cleanup_is_projected_before_output_and_never_changes_certification_status() {
-    use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixListener;
 
     for case in [
         "deleted",
+        "linked-parent-absolute",
+        "linked-parent-relative",
+        "linked-parent-home",
+        "plain-parent",
+        "linked-file",
         "changed",
         "missing",
         "permission",
@@ -432,44 +440,35 @@ fn certify_cleanup_is_projected_before_output_and_never_changes_certification_st
         let findings = parent.join("findings.json");
         fs::write(&findings, "[]").unwrap();
         fs::set_permissions(&findings, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(parent.join("child")).unwrap();
+        std::os::unix::fs::symlink("input/child", directory.0.join("linked")).unwrap();
+        let linked_file = directory.0.join("linked-file.json");
+        std::os::unix::fs::symlink("input/findings.json", &linked_file).unwrap();
+        let decoy = directory.0.join("findings.json");
+        let decoy_json = r#"[{"rule":"decoy","level":"warn","message":"wrong file"}]"#;
+        fs::write(&decoy, decoy_json).unwrap();
+        let input = match case {
+            "linked-parent-absolute" => directory.0.join("linked/../findings.json"),
+            "linked-parent-relative" => "linked/../findings.json".into(),
+            "linked-parent-home" => "~/linked/../findings.json".into(),
+            "plain-parent" => "input/child/../findings.json".into(),
+            "linked-file" => linked_file.clone(),
+            _ => findings.clone(),
+        };
         let socket = directory.0.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o666)).unwrap();
         let server_findings = findings.clone();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["params"]["findings"], json!([]));
-            match case {
-                "changed" => {
-                    fs::write(&server_findings, "[{\"rule\":\"new\",\"level\":\"warn\"}]").unwrap();
-                }
-                "missing" => fs::remove_file(&server_findings).unwrap(),
-                _ => {}
-            }
-            let mut response = json!({"requestId":"fixture", "result":{
-                "success":true,"exitCode":0,"errorType":"","data":{"status":"certified","versionId":"v000001"}
-            }});
-            if case == "daemon-error" {
-                response = json!({"requestId":"fixture","error":{"code":"deadline_exceeded","message":"deadline expired"}});
-            } else if case == "malformed" {
-                response["result"]["errorType"] = json!(false);
-            }
-            writeln!(stream, "{response}").unwrap();
-        });
+        let server =
+            std::thread::spawn(move || reply_to_certify(&listener, &server_findings, case));
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agent-sec-cli"));
         command
+            .current_dir(&directory.0)
+            .env("HOME", &directory.0)
             .arg("--socket")
             .arg(&socket)
-            .args(["skill-ledger", "certify", "/fixture/skill", "--findings"])
-            .arg(&findings);
+            .args(["skillsec", "certify", "/fixture/skill", "--findings"])
+            .arg(&input);
         if case != "retained" {
             command.arg("--delete-findings");
         }
@@ -482,6 +481,8 @@ fn certify_cleanup_is_projected_before_output_and_never_changes_certification_st
         let output = command.output().unwrap();
         server.join().unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(fs::read_to_string(&decoy).unwrap(), decoy_json, "{case}");
+        assert!(fs::symlink_metadata(&linked_file).unwrap().is_symlink());
         if matches!(case, "daemon-error" | "malformed") {
             assert!(!output.status.success(), "{case}");
             assert!(output.stdout.is_empty(), "{case}");
@@ -495,21 +496,52 @@ fn certify_cleanup_is_projected_before_output_and_never_changes_certification_st
         );
         let data: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(data["versionId"], "v000001");
+        let deleted = matches!(
+            case,
+            "deleted"
+                | "linked-parent-absolute"
+                | "linked-parent-relative"
+                | "linked-parent-home"
+                | "plain-parent"
+        );
         if case == "retained" {
             assert!(data.get("findingsDeleted").is_none());
         } else {
-            assert_eq!(data["findingsDeleted"], case == "deleted", "{case}");
-            assert_eq!(
-                data["findingsDeleteError"].is_string(),
-                case != "deleted",
-                "{case}"
-            );
+            assert_eq!(data["findingsDeleted"], deleted, "{case}");
+            assert_eq!(data["findingsDeleteError"].is_string(), !deleted, "{case}");
         }
-        assert_eq!(
-            findings.exists(),
-            !matches!(case, "deleted" | "missing"),
-            "{case}"
-        );
+        assert_eq!(findings.exists(), !deleted && case != "missing", "{case}");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("Policy template"));
     }
+}
+
+fn reply_to_certify(listener: &std::os::unix::net::UnixListener, findings: &Path, case: &str) {
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    let (mut stream, _) = listener.accept().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let request: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(request["params"]["findings"], json!([]));
+    match case {
+        "changed" => {
+            fs::write(findings, "[{\"rule\":\"new\",\"level\":\"warn\"}]").unwrap();
+        }
+        "missing" => fs::remove_file(findings).unwrap(),
+        _ => {}
+    }
+    let mut response = json!({"requestId":"fixture", "result":{
+        "success":true,"exitCode":0,"errorType":"","data":{"status":"certified","versionId":"v000001"}
+    }});
+    if case == "daemon-error" {
+        response = json!({"requestId":"fixture","error":{"code":"deadline_exceeded","message":"deadline expired"}});
+    } else if case == "malformed" {
+        response["result"]["errorType"] = json!(false);
+    }
+    writeln!(stream, "{response}").unwrap();
 }

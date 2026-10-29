@@ -10,7 +10,7 @@ use std::{
     mem,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -29,8 +29,6 @@ use super::tcpsniff::TcpSniff;
 use super::udpdns::{RawUdpDnsEvent, UdpDns};
 use crate::config::TcpTarget;
 
-const POLL_TIMEOUT_MS: u64 = 100;
-
 /// Snapshot of the probe event channel's byte accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelWatermarks {
@@ -42,96 +40,7 @@ pub struct ChannelWatermarks {
     pub dropped_over_budget: usize,
 }
 
-/// Byte-accounted admission gate for the probe event channel.
-///
-/// The channel's slot count cannot bound memory on its own: one SSL record
-/// carries up to `MAX_BUF_SIZE` (4 MiB), so the 10 000 default slots admit
-/// gigabytes of in-flight payload (#2888).
-///
-/// `max_bytes == 0` disables *rejection* but keeps accounting, matching how
-/// `retention_days` and `max_db_size_mb` already read 0 as "no limit" while
-/// still reporting size — an operator following that convention must not end up
-/// with everything dropped, nor lose the watermark readings.
-#[derive(Clone)]
-struct ChannelBudget {
-    max_bytes: usize,
-    in_flight: Arc<AtomicUsize>,
-    dropped_over_budget: Arc<AtomicUsize>,
-    dropped_total: Arc<AtomicUsize>,
-}
-
-impl ChannelBudget {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            max_bytes,
-            in_flight: Arc::new(AtomicUsize::new(0)),
-            dropped_over_budget: Arc::new(AtomicUsize::new(0)),
-            dropped_total: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// Reserve `bytes` for an event about to be published.
-    ///
-    /// Must be called *before* the event becomes visible to the consumer: a
-    /// post-send charge can lose the race against [`Self::release`] on the
-    /// consumer side, and the saturating subtraction would then turn the late
-    /// charge into a permanent phantom reservation that eventually wedges the
-    /// budget shut. Returns false and counts a drop when over budget.
-    fn reserve(&self, bytes: usize) -> bool {
-        let max_bytes = self.max_bytes;
-        let admitted = self
-            .in_flight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                // Saturating so a pathological size cannot wrap into a false pass.
-                let next = cur.saturating_add(bytes);
-                (max_bytes == 0 || next <= max_bytes).then_some(next)
-            })
-            .is_ok();
-        if !admitted {
-            self.dropped_over_budget.fetch_add(1, Ordering::Relaxed);
-            self.dropped_total.fetch_add(1, Ordering::Relaxed);
-        }
-        admitted
-    }
-
-    /// Give back a reservation whose event never reached the channel.
-    fn refund(&self, bytes: usize) {
-        self.give_back(bytes);
-    }
-
-    /// Count an event rejected after byte admission, such as a full slot queue
-    /// or an intentional sampling decision.
-    fn record_drop(&self) {
-        self.dropped_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Give back a reservation once the event has been delivered to the consumer.
-    fn release(&self, bytes: usize) {
-        self.give_back(bytes);
-    }
-
-    /// Saturating so an accounting mismatch cannot wrap the counter and lock out
-    /// admission forever.
-    fn give_back(&self, bytes: usize) {
-        let _ = self
-            .in_flight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                Some(cur.saturating_sub(bytes))
-            });
-    }
-
-    fn watermarks(&self) -> ChannelWatermarks {
-        ChannelWatermarks {
-            in_flight_bytes: self.in_flight.load(Ordering::Relaxed),
-            budget_bytes: self.max_bytes,
-            dropped_over_budget: self.dropped_over_budget.load(Ordering::Relaxed),
-        }
-    }
-
-    fn dropped_total(&self) -> usize {
-        self.dropped_total.load(Ordering::Relaxed)
-    }
-}
+use super::budget::ChannelBudget;
 
 /// Whether this cumulative drop count should be logged.
 ///
@@ -368,6 +277,26 @@ impl Probes {
         self.add_traced_pid(pid as u32)
     }
 
+    /// 未识别进程仅在确实关联到 uprobe 时注册，避免每个 exec 耗尽有界过滤表。
+    ///
+    /// 已识别 Agent 仍使用 [`Self::attach_process`]，保留全局 uprobe 的兜底覆盖。
+    ///
+    /// # Errors
+    ///
+    /// uprobe 已关联但 PID 无法注册时返回错误；无可用探针属于正常跳过。
+    pub fn attach_unclassified_process(&mut self, pid: i32) -> Result<()> {
+        if let Err(e) = self.attach_ssl_to_process(pid) {
+            log::debug!(
+                "[attach_unclassified_process] pid={pid}: no SSL attach ({e:#}); leaving the traced_processes slot free"
+            );
+            return Ok(());
+        }
+        if !self.sslsniff.has_process_attachments(pid as u32) {
+            return Ok(());
+        }
+        self.add_traced_pid(pid as u32)
+    }
+
     /// Attach SSL probes to a specific process
     pub fn attach_ssl_to_process(&mut self, pid: i32) -> Result<()> {
         self.sslsniff
@@ -531,22 +460,26 @@ impl Probes {
             .context("failed to add shared ring buffer")?;
         let rb = rb_builder.build().context("failed to build ring buffer")?;
 
+        // Read the configured poll timeout on this thread before spawning so
+        // the poller observes exactly the value `AgentSight::new` published
+        // (crate::config::set_poll_timeout_ms), not whatever the global holds
+        // when the thread happens to get scheduled.
+        let poll_timeout = Duration::from_millis(crate::config::poll_timeout_ms());
+
         let handle = thread::Builder::new()
             .name("probes-poll".into())
             .spawn(move || {
-                let timeout = Duration::from_millis(POLL_TIMEOUT_MS);
-                loop {
-                    if stop_flag_inner.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match rb.poll(timeout) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == libbpf_rs::ErrorKind::Interrupted => break,
-                        Err(e) => {
-                            eprintln!("probes poll error: {e:#}");
-                            break;
-                        }
-                    }
+                let timeout = poll_timeout;
+                let outcome = super::drive_poll_loop(timeout, &stop_flag_inner, |timeout| {
+                    rb.poll(timeout)
+                        .map(|_| ())
+                        .map_err(|error| match error.kind() {
+                            libbpf_rs::ErrorKind::Interrupted => super::PollFailure::Interrupted,
+                            _ => super::PollFailure::Fatal(format!("{error:#}")),
+                        })
+                });
+                if let super::PollEnd::Failed(message) = outcome {
+                    eprintln!("probes poll error: {message}");
                 }
             })
             .context("failed to spawn poll thread")?;

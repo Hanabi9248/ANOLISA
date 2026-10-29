@@ -7,7 +7,9 @@ const {
   enforcementSupportsContainment,
   enforcementSupportsMode,
   enforcementViolationTotal,
+  fetchAgentProtectionPreview,
   fetchContainmentPlan,
+  fetchInterruptionStats,
   fetchLatencyMetrics,
   fetchSecurityCase,
   fetchSecurityStatus,
@@ -21,6 +23,10 @@ const {
 const {
   containmentLifecyclePresentation,
 } = require(process.env.AGENTSIGHT_CONTAINMENT_LIFECYCLE_BUILD);
+const {
+  effectiveBindingMode,
+  legacyBindingMode,
+} = require(process.env.AGENTSIGHT_ENFORCEMENT_MODE_BUILD);
 const {
   formatNs,
   formatNsPadded,
@@ -98,6 +104,22 @@ function securityCaseDetail() {
     containment: null,
   };
 }
+
+test('fetchAgentProtectionPreview rejects a body that is not a preview', async () => {
+  // The macOS local viewer has no enforcement routes, so its `/api/*` catch-all
+  // answers this GET with `200 []`. The caller stores `preview.source_paths`
+  // (undefined) as its source list and the protection dialog then throws while
+  // rendering it, which React turns into a blank page rather than an error.
+  global.fetch = async () => new Response(JSON.stringify([]), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  await assert.rejects(
+    () => fetchAgentProtectionPreview(4242),
+    /protection preview is unavailable/,
+  );
+});
 
 test('fetchSecurityCase rejects a non-2xx state envelope before returning it', async () => {
   global.fetch = async () => new Response(JSON.stringify({
@@ -214,6 +236,34 @@ test('fetchStorageStatus preserves schema 2 maintenance and partial inventory fi
   assert.equal(response.stores[2].coverage, 'partial');
   assert.deepEqual(response.stores[0].maintenance, maintenance);
   assert.equal(response.stores[1].maintenance.next_run_unix_ms, null);
+});
+
+test('fetchInterruptionStats forwards the agent filter alongside the range', async () => {
+  const requested = [];
+  global.fetch = async (url) => {
+    requested.push(String(url));
+    return new Response(JSON.stringify([]), { status: 200 });
+  };
+
+  await fetchInterruptionStats(1000, 2000, 'claude-code');
+  await fetchInterruptionStats(1000, 2000);
+
+  const withAgent = new URL(requested[0]);
+  assert.equal(withAgent.pathname, '/api/interruptions/stats');
+  assert.equal(withAgent.searchParams.get('start_ns'), '1000');
+  assert.equal(withAgent.searchParams.get('end_ns'), '2000');
+  assert.equal(
+    withAgent.searchParams.get('agent_name'),
+    'claude-code',
+    'the tooltip breakdown must use the same agent scope as the badge',
+  );
+
+  const withoutAgent = new URL(requested[1]);
+  assert.equal(
+    withoutAgent.searchParams.get('agent_name'),
+    null,
+    'an omitted agent must not send agent_name',
+  );
 });
 
 test('fetchLatencyMetrics forwards ranges and preserves nullable percentile data', async () => {
@@ -607,4 +657,173 @@ test('fillTokenBuckets passes data through for a degenerate window', () => {
   ];
   // Zero-width range: bucketNs floors to 0 and the data is returned as-is.
   assert.equal(fillTokenBuckets(data, 5, 5, 30), data);
+});
+
+test('formatDurationSecs never renders 60 seconds inside a minute field', () => {
+  const { formatDurationSecs } = require(process.env.AGENTSIGHT_FORMAT_DURATION_BUILD);
+
+  assert.equal(formatDurationSecs(12.34), '12.3s');
+  assert.equal(formatDurationSecs(59.4), '59.4s');
+  // Rounding happened after the minute split before, yielding "60.0s",
+  // "1m 60s" and "59m 60s".
+  assert.equal(formatDurationSecs(59.96), '1m 0s');
+  assert.equal(formatDurationSecs(119.6), '2m 0s');
+  assert.equal(formatDurationSecs(3599.7), '60m 0s');
+  assert.equal(formatDurationSecs(125), '2m 5s');
+});
+
+// ─── richText: finding texts render only their two documented tags ──────────
+
+// The built component emits `require('react/jsx-runtime')` (compiled with
+// --jsx react-jsx, same as LoginPage), which does not resolve from the temp
+// outDir — stub it like the login regression does and run the built file in a
+// sandbox.
+function loadRichTextBuild() {
+  const { readFileSync } = require('node:fs');
+  const vm = require('node:vm');
+  const code = readFileSync(process.env.AGENTSIGHT_RICH_TEXT_BUILD, 'utf8');
+  const module = { exports: {} };
+  vm.runInNewContext(code, {
+    module,
+    exports: module.exports,
+    require: (name) => {
+      if (name === 'react/jsx-runtime') {
+        return {
+          jsx: (type, props) => ({ type, props }),
+          jsxs: (type, props) => ({ type, props }),
+        };
+      }
+      throw new Error(`unexpected require from richText.js: ${name}`);
+    },
+  });
+  return module.exports;
+}
+
+test('escapeRichText neutralizes markup injected through finding texts', () => {
+  const { escapeRichText } = loadRichTextBuild();
+
+  // Payload the server can really produce: confirm_before_act interpolates
+  // the raw tool command into the accuracy `detail` string.
+  const toolCmdPayload = 'tool `bash` ran `rm -rf <img src=x onerror=alert(1)>`';
+  const escaped = escapeRichText(toolCmdPayload);
+  assert.ok(!escaped.includes('<img'), 'an injected tag must not survive as markup');
+  assert.ok(escaped.includes('&lt;img src=x onerror=alert(1)&gt;'),
+    'the injected tag must render as literal text');
+
+  assert.ok(!escapeRichText('<script>alert(1)</script>').includes('<script'));
+  assert.ok(!escapeRichText('<svg onload=alert(1)>').includes('<svg'));
+  // Quotes and ampersands must not smuggle attributes into the allowed tags.
+  assert.equal(escapeRichText('a & b "c"'), 'a &amp; b &quot;c&quot;');
+});
+
+test('escapeRichText keeps only the exact documented tags', () => {
+  const { escapeRichText } = loadRichTextBuild();
+
+  assert.equal(escapeRichText('a <code>cmd</code> b'), 'a <code>cmd</code> b');
+  assert.equal(escapeRichText('<b>bold</b> stays'), '<b>bold</b> stays');
+  // A tag that merely starts like an allowed one must stay escaped, and no
+  // attributes may ride along on the allowed tags.
+  assert.equal(escapeRichText('<codeX>'), '&lt;codeX&gt;');
+  assert.ok(!escapeRichText('<code onclick=alert(1)>x</code>').includes('<code '));
+  assert.equal(escapeRichText('<i>no</i>'), '&lt;i&gt;no&lt;/i&gt;');
+});
+
+test('RichText sanitizes what it injects into the DOM', () => {
+  const { RichText } = loadRichTextBuild();
+
+  const element = RichText({ children: 'x <img src=x onerror=alert(1)> <code>ok</code>' });
+  const html = element.props.dangerouslySetInnerHTML.__html;
+  assert.ok(!html.includes('<img'), 'the component must not inject raw tags');
+  assert.ok(html.includes('<code>ok</code>'), 'the documented tag survives');
+});
+
+test('optimization findings render through the sanitizer, not raw strings', () => {
+  const { readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const source = readFileSync(join(process.cwd(), 'src/pages/OptimizationPage.tsx'), 'utf8');
+  assert.match(source, /import \{ RichText \} from '\.\.\/utils\/richText';/,
+    'the page must render finding texts through utils/richText');
+  assert.doesNotMatch(source, /dangerouslySetInnerHTML=\{\{ __html: s \}\}/,
+    'the page must not inject the raw finding string into the DOM');
+});
+
+const { sameMembers } = require(process.env.AGENTSIGHT_SET_SELECTION_BUILD);
+
+test('selection shortcuts compare members, not sizes', () => {
+  // Picking "select unknown" with three hand-ticked rows of other sessions
+  // used to clear the selection: the sizes matched, the members did not.
+  const ticked = new Set(['a', 'b', 'c']);
+  assert.equal(sameMembers(ticked, new Set(['a', 'b', 'c'])), true);
+  assert.equal(sameMembers(ticked, new Set(['a', 'b', 'd'])), false);
+  assert.equal(sameMembers(ticked, new Set(['a', 'b'])), false);
+  assert.equal(sameMembers(new Set(), new Set()), true);
+  assert.equal(sameMembers(ticked, new Set()), false);
+});
+
+test('legacy bindings report their enforcing mode from the DSL', () => {
+  // Enforcers built before `policy_mode` existed persisted only the DSL. The
+  // audit view read the field directly, so a binding that blocks showed as
+  // audit-only while the enforcement page showed it as blocking.
+  const legacy = { policy_mode: null, policy_dsl: 'block open file "/etc/passwd" if AGENT' };
+  // What the audit view used to evaluate — the stored field is simply absent
+  // on rows written by an older enforcer, so the check answered false.
+  assert.notEqual(legacy.policy_mode, 'enforce');
+  assert.equal(effectiveBindingMode(legacy), 'enforce');
+  assert.equal(
+    effectiveBindingMode({ policy_mode: null, policy_dsl: 'block connect endpoint "*" if CREDENTIAL' }),
+    'enforce',
+  );
+  assert.equal(
+    effectiveBindingMode({ policy_mode: null, policy_dsl: 'notify connect endpoint "*" if CREDENTIAL' }),
+    'audit',
+  );
+  assert.equal(
+    effectiveBindingMode({ policy_mode: null, policy_dsl: 'allow open file "*" if AGENT' }),
+    'observe',
+  );
+  // A stored mode wins over the DSL shape.
+  assert.equal(effectiveBindingMode({ policy_mode: 'audit', policy_dsl: 'block open file "x" if AGENT' }), 'audit');
+  assert.equal(legacyBindingMode('block open file "x" if AGENT'), 'enforce');
+});
+
+test('a legacy binding mode follows the rule verb, not two literal rule shapes', () => {
+  // The inode guard writes `block unlink file`, ActPlane hands over `block
+  // exec` and `kill exec`, and the inode fixtures use `notify open file`. Only
+  // `block connect endpoint` / `block open file` / `notify connect endpoint`
+  // were recognised, so every other blocking rule was reported as observing —
+  // the enforcement badge and the audit overview both claimed a binding that
+  // blocks was not enforcing anything.
+  assert.equal(
+    legacyBindingMode('rule protected:\nblock unlink file "/tmp/x" if AGENT\nbecause "keep fixture"'),
+    'enforce',
+  );
+  assert.equal(legacyBindingMode('rule r:\n  block exec "git" if AGENT\n  because "x"'), 'enforce');
+  assert.equal(legacyBindingMode('rule r:\n  kill exec "rm" if AGENT\n  because "x"'), 'enforce');
+  assert.equal(
+    legacyBindingMode('rule r:\n  notify open file "/tmp/never-matches" if AGENT\n  because "unrelated"'),
+    'audit',
+  );
+  // The reason prose must not decide the mode: a `notify` rule whose reason
+  // mentions blocking still audits.
+  assert.equal(
+    legacyBindingMode('rule r:\n  notify connect endpoint "*" if AGENT\n  because "block the exfiltration"'),
+    'audit',
+  );
+  // A DSL that carries no rule at all still observes.
+  assert.equal(legacyBindingMode('source AGENT = exec "**"'), 'observe');
+});
+
+test('both protection views resolve a binding mode through the shared helper', () => {
+  // The audit view read `policy_mode` directly, so a binding persisted by an
+  // older enforcer — where the field is absent and only the DSL carries the
+  // mode — reported as audit-only while it was actually blocking. Both views
+  // must ask the shared helper, or they can disagree again.
+  const { readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const auditPage = readFileSync(join(process.cwd(), 'src/pages/SystemAuditPage.tsx'), 'utf8');
+  const riskPage = readFileSync(join(process.cwd(), 'src/pages/RiskEnforcementPage.tsx'), 'utf8');
+
+  assert.match(auditPage, /effectiveBindingMode\(binding\.request\) === 'enforce'/);
+  assert.match(riskPage, /effectiveBindingMode\(binding\.request\)/);
+  assert.doesNotMatch(auditPage, /request\.policy_mode === 'enforce'/);
 });

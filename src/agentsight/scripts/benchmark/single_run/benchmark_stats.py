@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from statistics import fmean
 from typing import Any
 
@@ -13,7 +14,7 @@ def numeric(value: Any) -> float | None:
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
 
@@ -23,20 +24,28 @@ def percentile(values: list[float], fraction: float = 0.95) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
+    return _percentile_from_sorted(ordered, fraction)
+
+
+def _percentile_from_sorted(ordered: list[float], fraction: float) -> float | None:
+    """Select a nearest rank from an already ordered snapshot."""
+    if not ordered:
+        return None
     index = max(0, math.ceil(len(ordered) * fraction) - 1)
     return ordered[index]
 
 
 def stats(values: list[float]) -> dict[str, float | None]:
     """Calculate the values most useful when scanning a report."""
+    ordered = sorted(values)
     return {
         "first": values[0] if values else None,
         "last": values[-1] if values else None,
         "min": min(values) if values else None,
         "avg": fmean(values) if values else None,
-        "p50": percentile(values, 0.50),
-        "p95": percentile(values),
-        "p99": percentile(values, 0.99),
+        "p50": _percentile_from_sorted(ordered, 0.50),
+        "p95": _percentile_from_sorted(ordered, 0.95),
+        "p99": _percentile_from_sorted(ordered, 0.99),
         "max": max(values) if values else None,
     }
 
@@ -67,11 +76,16 @@ def rolling_max_increase(
     if len(samples) < 2:
         return None
     largest: float | None = None
-    left = 0
+    minimums: deque[int] = deque()
     for right, (timestamp, value) in enumerate(samples):
-        while left < right and timestamp - samples[left][0] > window_seconds:
-            left += 1
-        minimum = min(sample[1] for sample in samples[left : right + 1])
-        increase = value - minimum
+        while minimums and value < samples[minimums[-1]][1]:
+            minimums.pop()
+        minimums.append(right)
+        while (
+            len(minimums) > 1
+            and timestamp - samples[minimums[0]][0] > window_seconds
+        ):
+            minimums.popleft()
+        increase = value - samples[minimums[0]][1]
         largest = increase if largest is None else max(largest, increase)
     return largest

@@ -321,6 +321,14 @@ failed item 导致 `success=false, exit_code=1`，但 `error_type` 为空，因�
 verdict 值域严格为 `pass/warn/deny/error`；finding severity 只为 `warn/deny`。built-in
 regex rules 当前可能只产生 pass/warn，但 deny 是 custom/LLM rule 的合法值，不能删除。
 
+regex 模式扫描 Python 时，除 Python 规则外，还从 `os.system`、`os.popen` 以及受支持的
+`subprocess` 执行 API 中提取在第一个参数位置通过位置参数或对应关键字参数传入的直接
+字符串命令，并复用 Bash 规则扫描该命令。关键字参数按 API 的 Python 签名匹配：`os.system` 使用
+`command`，`os.popen`、`subprocess.getoutput` 和 `subprocess.getstatusoutput` 使用 `cmd`，
+其余受支持的 `subprocess` API 使用 `args`。结果保留 Bash 规则原生的 `rule_id`、severity、
+描述和 evidence，顶层 `language` 仍为 `python`。变量、拼接字符串、带前缀字符串、argv
+列表、别名调用和其它动态表达式不执行 Shell 规则复用。
+
 ### 7.3 Success/error
 
 | 情况 | success | exit_code | error_type |
@@ -329,8 +337,17 @@ regex rules 当前可能只产生 pass/warn，但 deny 是 custom/LLM rule 的�
 | error verdict | false | 1 | `CodeScanError` |
 | unsupported language | false | 1 | `ErrUnsupportedLang`，data 为空 |
 
-stdout 是 data 的 JSON。`AGENT_SEC_OLLAMA_MODEL` 选择 LLM model（默认 `warden`）；模型
-service backend/base URL/timeout 使用共享 model-service 配置。
+stdout 是 data 的 JSON。`AGENT_SEC_OLLAMA_MODEL` 选择 LLM model（未设置时默认 `warden`）；模型
+service backend/base URL/timeout 使用共享 model-service 配置。LLM mode 的 daemon 与 CLI deadline
+按照该请求 timeout 预留一次模型检查、一次 chat 及一次 chat 重试的完整预算，不能以固定短
+期限截断已配置的本地推理。
+
+`llm` 模式先按与 regex 相同的规则拒绝空/纯空白 `code`，不会因模型可用性改变该
+结果。其后检查本地模型并以 `temperature=0`、`seed=42` 请求 JSON chat；模型输出只接受
+`PASS` 或 `DENY`（JSON 或仅含一个 verdict token 的文本）。`DENY` 映射为成功的 `warn`
+结果和 `llm-judge` finding；无法判定的输出产生 `error` verdict，summary 保留最多 120
+个字符的原始输出上下文。模型不可用或请求失败同样是 `error` verdict，不是 daemon
+protocol error。
 
 ## 8. `prompt_scan`
 
@@ -487,6 +504,18 @@ ActionResult 同时设置 error/error_type，stdout 不含 traceback。
 业务调用方可以显式请求 raw evidence，但 SecurityEvent 永远删除原文、raw evidence 和
 redacted text；只保存 text length/SHA-256、扫描选项和 sanitized finding。Rust backend
 必须在 lifecycle 前使用相同 sanitizer。
+
+### 9.5 邮箱句末边界
+
+Python V1 和 Rust V2 使用相同的句末边界规则：邮箱候选后的连续 ASCII `.` 只有在其后为输入结束、
+空白或固定分隔符时才作为句末标点。固定分隔符为 ASCII 双引号、单引号、`)]}>,;:!?` 和
+`，。；：！？、）］｝】〕》〉」』”’`。没有紧随句号的候选保持原有边界行为；word 字符和 `-`
+仍不能直接作为邮箱右边界。
+
+候选仍须通过完整邮箱语法和长度校验。合法多级域名必须完整匹配；`.123`、`.c`、`.-bad`、
+`._bad` 和 `..evil` 等非法后缀不能通过截取较短域名产生 finding。句末标点不进入 span 或脱敏
+替换范围。置信度计算、保留域名、远程身份、severity、Host policy、截断及 deadline 语义不变。
+该检测修复不改变 CLI/RPC 参数、结果 schema 或扫描器版本标识。
 
 ## 10. `skill_ledger`
 
@@ -689,12 +718,23 @@ root 注入依赖；agent-sec-cli 只处理终端交互和 RPC DTO，不读取�
 V2 使用 fancy-regex，回溯上限 1,000,000、循环预算 200 ms；不承诺 20 ms 中断单次匹配。
 100 条自定义发现之后首次省略命中会停止后续匹配。自定义规则直接采用 fancy-regex 原生语义；
 与 Python 不同本身不构成错误，invalid_regex 仅用于实际解析/编译/引擎限制或加载求值失败。
-检测语义版本 `scanner_version=2.0.0` 纳入规则标识，成功/失败报告及审计均保留；
-内置 engine 为 regex_v2，自定义为 fancy_regex。此版本修复空 claims JWT 的候选漏报，
+检测语义版本 `scanner_version=2.1.1` 纳入规则标识，成功/失败报告及审计均保留；
+内置 engine 为 regex_v2，自定义为 fancy_regex。2.0.0 修复空 claims JWT 的候选漏报，
 接受结构正确的大整数/深层 JSON；身份证统一 decimal 校验并支持全角 X，银行卡排除全零。
-其他格式、置信度、位置和脱敏契约保留，变化由独立质量用例定义。
+2.0.1 与保留的 Python 检测器同步要求完整卡号表达式、支持网络的前缀/长度组合及 Luhn；
+非常规分组及不合法表达式内部的局部匹配被拒绝。格式范围和边界见
+[PII 用户指南](../../../../docs/user-guide/zh/agent-sec-core/pii-checker.md#支持的银行卡格式)。
+其他检测类型、置信度和脱敏格式保留，变化由共享卡号语料及独立质量用例定义。
 
-差分和限制由 capability 的 `tests/compatibility.rs`、`tests/custom_rules.rs`、冻结 142 个
+2.1.1 将负向上下文 `example`、`dummy`、`test`、`sample` 改为不区分 ASCII 大小写的
+完整词匹配，避免 `latest` 等普通词使真实敏感信息降分。词边界沿用 Python 3.11 / Unicode 14
+字符表（字母、数字及下划线属于 word），在原文检查边界，64 字符窗口截断不产生新边界。
+`test-only`、`sample-data` 仍是测试标记；`.invalid` 保留子串匹配。正向连字符归一化、
+`+0.12/-0.35` 权重、低置信度阈值和 email/private-key 例外不变。冻结 V1 语料保留原始
+记录；兼容测试显式分类 `sk-test987…` 及 `LTAI5tQnKxExampleToken12` 上下文的置信度变化，
+其他预期字段继续逐项比较。
+
+差分和限制由 capability 的 `tests/compatibility.rs`、`tests/custom_rules.rs`、冻结 234 个
 V1 合成用例及单测验证。完整差异、未来 Evidence 边界和回滚见
 [PII 两阶段设计](PII_V2_MIGRATION_zh.md)。保留 V1 实现独立回滚。
 
@@ -703,7 +743,12 @@ V1 合成用例及单测验证。完整差异、未来 Evidence 边界和回滚�
 `asc-capability-skill-sec` 的 SkillSecExecutor 通过共享 SkillSecService 执行业务，
 SkillSecAuditProjector 单独生成公共审计投影，ActionRuntime/Finalizer/Sink 统一收尾。
 ActionId::SkillSec 的 event_type/category 均保持 `skill_ledger`。调用者 UID/PID 来自内核，
-请求 JSON 无法覆盖；启动 reconcile 记录实际 daemon 进程身份。
+请求 JSON 无法覆盖；启动 reconcile 和内部 StartupScan 记录实际 daemon 进程身份。
+聚合发现部分失败返回保留成功项的 `discoveryErrors: [{root, error}]`，退出码 1、
+errorType=SkillLedgerError；init/scan/check 审计 verdict=error，status 不生成风险 verdict。
+公共审计只增加 discoveryErrorCount，不复制错误路径或原文；status 健康状态为 critical。
+全部发现失败不创建扫描或 baseline 密钥，强制密钥初始化也不得变更密钥。
+可执行边界为 capability 的 `tests/scope.rs`。
 
 [PRESERVE V1] scan/certify 完成风险扫描仍退出 0；check deny/tampered/error 退出 1；
 audit 根据 valid 退出；analyze 完整风险结果退出 0、覆盖不足 1、非法输入 2。业务失败与执行错误
@@ -711,7 +756,17 @@ audit 根据 valid 退出；analyze 完整风险结果退出 0、覆盖不足 1�
 status/version/exitCode 和错误类别；不复制源码、findings、路径、人工理由、导入证据或密钥。
 
 [批准替代] key/status 使用系统密钥身份，不包含用户公钥路径、口令或历史 keyring；init-keys 和
---passphrase 不保留。init --no-baseline 只建密钥，force-keys 与 rotate-keys 为 root-only。
+--passphrase 不保留。init --no-baseline 只建密钥且保持幂等；force-keys 与 rotate-keys 不支持，
+CLI 在目录发现前非零退出，RPC 在解析 Skill 根目录及业务副作用前返回 NotImplementedError、
+exitCode 1。不再维护换钥事务；managed-skills.json 和 key-rotation.json 不读写、不检测、
+不迁移，也不删除。正常初始化、密钥权限及完整性校验、单 Skill 回滚恢复及其校验顺序保留。
+
+[批准替代] 成功 scan/certify/noop 将 canonical 精确路径记入 daemon 实际使用的系统配置
+managedSkillDirs。普通目录已被模式覆盖时不重复添加；SkillFS 映射目录保存精确项，以供重启后
+直接解析而不遍历 FUSE。该项同时授予普通目录访问权限；移除挂载或关闭默认目录发现后，
+仍须移除该配置项并重启 daemon 才撤销。
+保存失败追加 warnings，不丢弃扫描 findings 或激活结果。启动、status 和聚合操作共用配置发现，
+不再通过私有登记表补充无法发现目录的全局恢复覆盖。show 对映射 Skill 的已有账本仍验证并报告风险。
 完整输出仍通过 Rust CLI 提供，CLI 不执行任何本地能力回退。每次最多两个 SkillSec 执行，
 满载返回 Busy 并经过相同 finalizer；同 Skill 的写操作继续由 Service 锁串行化。
 

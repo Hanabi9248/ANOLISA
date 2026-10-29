@@ -2,12 +2,24 @@
 //! Callers retain scheduling, policy decisions and interpretation of native responses.
 
 use std::{
-    collections::BTreeMap, ffi::OsString, io, path::PathBuf, process::ExitStatus,
-    sync::atomic::AtomicBool, time::Instant,
+    collections::BTreeMap,
+    ffi::OsString,
+    io,
+    path::PathBuf,
+    process::ExitStatus,
+    sync::atomic::AtomicBool,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod package_lock;
+mod packages;
+#[cfg(target_os = "linux")]
+pub use package_lock::PackageLock;
+
+pub use packages::{LeaseError, PackageLeases};
 
 /// Explicit process context; arguments are literal and the environment is not inherited.
 ///
@@ -123,7 +135,9 @@ pub enum Error {
 /// scheduling. They must leave child reaping to this function (no competing
 /// wait or automatic SIGCHLD reaping). This is process hygiene, not a sandbox:
 /// descendants can escape the group, and kernel-blocked calls are not hard
-/// realtime bounded. A forcibly terminated caller cannot perform cleanup.
+/// realtime bounded. Linux kills the immediate child if its owning thread dies;
+/// a forcibly terminated caller still cannot verify or clean up descendants.
+/// Privilege-changing executables can clear that parent-death signal.
 ///
 /// # Errors
 /// Returns typed errors for cancellation, deadline, stream limits, spawn/pipe
@@ -138,11 +152,164 @@ pub fn run(
 ) -> Result<Output, Error> {
     #[cfg(target_os = "linux")]
     {
-        linux::run(command, input, limits, deadline, cancelled)
+        linux::run(command, input, limits, deadline, cancelled, false)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (command, input, limits, deadline, cancelled);
+        Err(Error::UnsupportedPlatform)
+    }
+}
+
+/// Run a cooperative wrapper, notifying it before forced cleanup on transport failure.
+///
+/// Shares [`run`]'s byte, deadline and process-group guarantees. On failure, sends
+/// SIGTERM and allows up to 250 ms for the wrapper to cancel its nested commands,
+/// then performs the same forced group cleanup with its separate one-second budget.
+/// The wrapper must install a SIGTERM handler before spawning nested commands and
+/// use [`run`] for those commands so their cancellation does not add another grace.
+/// Successful exchanges keep immediate cleanup. Uncooperative wrappers and escaped
+/// descendants retain [`run`]'s limitations; this does not create a sandbox.
+///
+/// # Errors
+/// Returns the same errors as [`run`], including unverifiable termination/cleanup.
+pub fn run_cooperative(
+    command: &CommandSpec,
+    input: &[u8],
+    limits: Limits,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Output, Error> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::run(command, input, limits, deadline, cancelled, true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command, input, limits, deadline, cancelled);
+        Err(Error::UnsupportedPlatform)
+    }
+}
+
+/// Run an Agent with inherited terminal streams and exclusive process-group ownership.
+///
+/// The session lasts until the child exits or the caller supplies a termination
+/// signal. Pending signals are forwarded to the owned group; termination then
+/// has a two-second grace period. The foreground terminal is restored and owned
+/// descendants are stopped before returning the original child exit status.
+/// The caller must serialize foreground sessions and own signal-handler setup.
+/// This is foreground execution, not a shell job-control implementation.
+///
+/// # Errors
+/// Rejects spawn, terminal-transfer, child-wait and bounded cleanup failures.
+pub fn run_foreground(
+    command: &CommandSpec,
+    signal: &std::sync::atomic::AtomicI32,
+) -> Result<ExitStatus, Error> {
+    run_foreground_observed(command, signal, |_| {})
+}
+
+/// Run a foreground Agent and report its owned leader PID after terminal handoff.
+///
+/// `started` runs once on the caller's thread after successful spawn and terminal
+/// transfer, before waiting for exit. The PID is also the owned process-group ID.
+/// The callback must return promptly and must not reap the child; the executor
+/// retains exclusive cleanup ownership. Spawn/transfer failure does not call it.
+/// See [`run_foreground`] for signal, terminal and lifetime guarantees.
+///
+/// # Errors
+/// Returns the same execution and cleanup errors as [`run_foreground`].
+pub fn run_foreground_observed(
+    command: &CommandSpec,
+    signal: &std::sync::atomic::AtomicI32,
+    started: impl FnOnce(u32),
+) -> Result<ExitStatus, Error> {
+    run_foreground_with_grace(
+        command,
+        signal,
+        &AtomicBool::new(false),
+        Duration::from_secs(2),
+        started,
+    )
+}
+
+/// Run a foreground Agent with a bounded cooperative shutdown grace.
+///
+/// The first forwarded `signal` starts `shutdown_grace`; later signals never
+/// extend it. Setting `failed` requests SIGTERM with at most two seconds left,
+/// independently of the configured grace. Failure can shorten but never extend
+/// an existing deadline. The caller retains ownership of both signal sources.
+/// Leader exit still triggers immediate cleanup of owned descendants.
+/// See [`run_foreground_observed`] for terminal and callback guarantees.
+///
+/// # Errors
+/// Rejects grace outside 1 ms..=120 s before spawning, and returns the execution
+/// and cleanup errors described in [`run_foreground`].
+pub fn run_foreground_with_grace(
+    command: &CommandSpec,
+    signal: &std::sync::atomic::AtomicI32,
+    failed: &AtomicBool,
+    shutdown_grace: Duration,
+    started: impl FnOnce(u32),
+) -> Result<ExitStatus, Error> {
+    run_foreground_mode(command, signal, failed, shutdown_grace, false, started)
+}
+
+/// Run a worker that owns the graceful shutdown of its subprocesses.
+///
+/// External signals reach only the unreaped worker PID so its SDK transports
+/// remain available during cleanup. Internal failure still signals the group;
+/// deadline expiry and worker exit still force cleanup of the whole group.
+/// Terminal-generated signals continue to follow the kernel foreground group.
+/// All other guarantees match [`run_foreground_with_grace`].
+///
+/// # Errors
+/// Returns the same validation and cleanup errors as [`run_foreground_with_grace`].
+pub fn run_foreground_worker_with_grace(
+    command: &CommandSpec,
+    signal: &std::sync::atomic::AtomicI32,
+    failed: &AtomicBool,
+    shutdown_grace: Duration,
+    started: impl FnOnce(u32),
+) -> Result<ExitStatus, Error> {
+    run_foreground_mode(command, signal, failed, shutdown_grace, true, started)
+}
+
+fn run_foreground_mode(
+    command: &CommandSpec,
+    signal: &std::sync::atomic::AtomicI32,
+    failed: &AtomicBool,
+    shutdown_grace: Duration,
+    leader_signals: bool,
+    started: impl FnOnce(u32),
+) -> Result<ExitStatus, Error> {
+    if shutdown_grace < Duration::from_millis(1) || shutdown_grace > Duration::from_secs(120) {
+        return Err(Error::Io {
+            operation: "foreground shutdown grace",
+            source: io::Error::new(io::ErrorKind::InvalidInput, "must be within 1..120000 ms"),
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::foreground::run(
+            command,
+            signal,
+            failed,
+            shutdown_grace,
+            leader_signals,
+            started,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            command,
+            signal,
+            failed,
+            shutdown_grace,
+            leader_signals,
+            started,
+        );
         Err(Error::UnsupportedPlatform)
     }
 }

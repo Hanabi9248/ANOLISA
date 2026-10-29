@@ -23,6 +23,7 @@ sys.path.insert(0, str(CAMPAIGN_DIR))
 sys.path.insert(0, str(SINGLE_RUN_DIR))
 
 import aggregate_report
+import benchmark_stats
 import campaign
 import campaign_evaluation
 import campaign_evidence
@@ -189,6 +190,35 @@ def test_request_recorder_keeps_ids_on_disk_and_bounds_open_files(
     assert not (tmp_path.parent / "invalid.jsonl").exists()
     recorder.close()
     assert recorder.handle is None
+
+
+@pytest.mark.parametrize(
+    "observations",
+    [
+        [("complete", 19), ("pending", 20)],
+        [("interrupted", 20), ("complete", 19)],
+        [("complete", None), ("pending", 20)],
+    ],
+)
+def test_token_accuracy_requires_a_complete_record_with_the_expected_tokens(
+    observations: list[tuple[str, int | None]],
+) -> None:
+    report = validate_results.make_report({"bench-1"}, {"bench-1"}, {"bench-1": observations}, 20)
+    assert report["completeness_ratio"] == 1
+    assert report["token_accuracy"] == 0
+    assert report["token_correct"] == 0
+
+
+def test_report_token_total_uses_the_same_correct_complete_observation() -> None:
+    report = validate_results.make_report(
+        {"bench-1"},
+        {"bench-1"},
+        {"bench-1": [("complete", 19), ("pending", 21), ("complete", 20)]},
+        20,
+    )
+    assert report["token_accuracy"] == 1
+    assert report["completeness_ratio"] == 1
+    assert report["captured_total_tokens"] == 20
 
 
 def test_validate_results_matches_token_and_event_records(tmp_path: Path) -> None:
@@ -415,6 +445,158 @@ def test_streaming_validation_waits_for_load_completion_marker(
     assert report["retention_safe"] is True
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("release_lock", [False, True])
+def test_validation_retries_busy_reads_without_extending_its_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    streaming: bool,
+    release_lock: bool,
+) -> None:
+    db_path = tmp_path / "capture.db"
+    writer = sqlite3.connect(db_path)
+    writer.executescript(
+        "CREATE TABLE genai_events (id INTEGER PRIMARY KEY, call_id TEXT, "
+        "status TEXT, total_tokens INTEGER);"
+        "INSERT INTO genai_events VALUES (1, 'bench-busy', 'complete', 20);"
+    )
+    writer.execute("BEGIN EXCLUSIVE")
+    ledger = tmp_path / "requests.jsonl"
+    ledger.write_text('{"request_id":"bench-busy","http_status":200}\n')
+    marker = tmp_path / "complete"
+    marker.touch()
+
+    def unlock(_: float) -> None:
+        assert release_lock, "a zero-length deadline must not sleep or retry"
+        writer.commit()
+
+    monkeypatch.setattr(validate_results.time, "sleep", unlock)
+    wait = 2 if release_lock else 0
+    expected = {"bench-busy"}
+    try:
+        if streaming:
+            report = validate_results.wait_for_streaming_report(
+                db_path,
+                ledger,
+                marker,
+                "bench-",
+                20,
+                1.0,
+                wait,
+                0.001,
+                request_log=ledger,
+            )
+        else:
+            report = validate_results.wait_for_report(
+                db_path,
+                "bench-",
+                expected,
+                expected,
+                20,
+                1.0,
+                wait,
+                0.001,
+            )
+    finally:
+        writer.rollback()
+        writer.close()
+    assert report["complete"] == int(release_lock)
+    assert report["token_correct"] == int(release_lock)
+    assert report["missing_ids"] == ([] if release_lock else ["bench-busy"])
+    assert "Capture database busy" in caplog.text
+
+
+def test_streaming_validation_keeps_cursors_and_evidence_after_a_busy_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "capture.db"
+    writer = sqlite3.connect(db_path)
+    writer.executescript(
+        "CREATE TABLE genai_events (id INTEGER PRIMARY KEY, call_id TEXT, "
+        "status TEXT, total_tokens INTEGER);"
+        "INSERT INTO genai_events VALUES (1, 'bench-1', 'complete', 20);"
+        "INSERT INTO genai_events VALUES (2, 'bench-2', 'pending', NULL);"
+    )
+    ledger = tmp_path / "requests.jsonl"
+    ledger.write_text(
+        "".join(
+            json.dumps({"request_id": f"bench-{i}", "http_status": 200}) + "\n" for i in (1, 2, 3)
+        )
+    )
+    marker = tmp_path / "complete"
+    polls = 0
+
+    def advance_writer(_: float) -> None:
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            writer.execute("BEGIN EXCLUSIVE")
+            writer.execute("DELETE FROM genai_events WHERE id = 1")
+            writer.execute(
+                "UPDATE genai_events SET status = 'complete', total_tokens = 20 WHERE id = 2"
+            )
+            writer.execute("INSERT INTO genai_events VALUES (3, 'bench-3', 'complete', 20)")
+        elif polls == 2:
+            writer.commit()
+            marker.touch()
+        else:
+            pytest.fail("capture did not resume from the pending row and saved cursor")
+
+    monkeypatch.setattr(validate_results.time, "sleep", advance_writer)
+    try:
+        report = validate_results.wait_for_streaming_report(
+            db_path,
+            ledger,
+            marker,
+            "bench-",
+            20,
+            1.0,
+            2,
+            0.001,
+            request_log=ledger,
+        )
+    finally:
+        writer.rollback()
+        writer.close()
+    assert polls == 2
+    assert report["complete"] == 3
+    assert report["token_correct"] == 3
+    assert report["missing_ids"] == []
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_validation_propagates_database_errors_other_than_lock_contention(
+    tmp_path: Path, streaming: bool
+) -> None:
+    db_path = tmp_path / "invalid-schema.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE token_records (request_id TEXT)")
+    with pytest.raises(sqlite3.OperationalError, match="no such column"):
+        if streaming:
+            validate_results.wait_for_streaming_report(
+                db_path,
+                tmp_path / "load",
+                tmp_path / "marker",
+                "bench-",
+                20,
+                1.0,
+                0,
+                0.001,
+            )
+        else:
+            validate_results.wait_for_report(
+                db_path,
+                "bench-",
+                set(),
+                set(),
+                20,
+                1.0,
+                0,
+                0.001,
+            )
+
+
 def test_validate_results_handles_invalid_json_and_empty_expected(
     tmp_path: Path,
 ) -> None:
@@ -423,6 +605,109 @@ def test_validate_results_handles_invalid_json_and_empty_expected(
     assert validate_results.load_expected(path) == (set(), set())
     report = validate_results.make_report(set(), set(), {}, None)
     assert report["completeness_ratio"] == 0
+
+
+def test_load_expected_skips_malformed_optional_status(tmp_path: Path) -> None:
+    """A malformed optional data.status contributes no success evidence.
+
+    The legacy k6 fallback must keep reading later records, keep every request
+    ID, and keep successes already confirmed by the independent
+    benchmark_http_success metric instead of aborting on int(status).
+    """
+    rows = [
+        {"request_id": "bad-list", "data": {"status": ["200"]}},
+        {"request_id": "bad-object", "data": {"status": {"code": 200}}},
+        {"request_id": "bad-string", "data": {"status": "ok"}},
+        {"request_id": "bad-nan", "data": {"status": float("nan")}},
+        {"request_id": "bad-inf", "data": {"status": float("inf")}},
+        {
+            "request_id": "metric-then-malformed",
+            "metric": "benchmark_http_success",
+            "data": {"value": 1, "status": {"bad": True}},
+        },
+        {"request_id": "null-status", "data": {"status": None}},
+        {"request_id": "valid-later", "data": {"status": 204}},
+    ]
+    path = tmp_path / "malformed.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+    expected, successful = validate_results.load_expected(path)
+    assert expected == {
+        "bad-list",
+        "bad-object",
+        "bad-string",
+        "bad-nan",
+        "bad-inf",
+        "metric-then-malformed",
+        "null-status",
+        "valid-later",
+    }
+    assert successful == {"metric-then-malformed", "valid-later"}
+
+
+def test_load_expected_skips_malformed_optional_data(tmp_path: Path) -> None:
+    """A malformed optional ``data`` envelope contributes no success evidence.
+
+    ``data`` and its ``tags`` are optional load-generator metadata whose shape
+    is not guaranteed: a list, string or null value raised AttributeError from
+    ``.get`` and aborted the whole read, so every later request ID was lost and
+    the comparison failed with a traceback instead of reporting the run. A
+    non-dict value must contribute no evidence while the top-level request ID,
+    the ``tags.request_id`` fallback and the success metrics keep working.
+    """
+    rows = [
+        {"request_id": "bad-data-list", "data": []},
+        {"request_id": "bad-data-null", "data": None},
+        {"request_id": "bad-data-string", "data": "200"},
+        {"data": {"tags": []}},
+        {"data": {"tags": "request_id=tags-id"}},
+        {"data": {"tags": {"request_id": "tags-id"}}},
+        {
+            "request_id": "metric-then-malformed",
+            "metric": "benchmark_http_success",
+            "data": {"value": 1},
+        },
+        {"request_id": "valid-later", "data": {"status": 204}},
+    ]
+    path = tmp_path / "malformed-data.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+    expected, successful = validate_results.load_expected(path)
+    assert expected == {
+        "bad-data-list",
+        "bad-data-null",
+        "bad-data-string",
+        "tags-id",
+        "metric-then-malformed",
+        "valid-later",
+    }
+    assert successful == {"metric-then-malformed", "valid-later"}
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_success"),
+    [
+        (200, True),
+        (299, True),
+        (300, False),
+        (199, False),
+        ("201", True),
+        ("300", False),
+        (200.9, True),
+        (True, False),
+        (None, False),
+    ],
+)
+def test_load_expected_status_coercion_is_unchanged(
+    tmp_path: Path, status: object, expected_success: bool
+) -> None:
+    row = {"request_id": "coerce", "data": {"tags": {}, "status": status}}
+    path = tmp_path / "coerce.jsonl"
+    path.write_text(json.dumps(row), encoding="utf-8")
+
+    expected, successful = validate_results.load_expected(path)
+    assert expected == {"coerce"}
+    assert ("coerce" in successful) is expected_success
 
 
 def test_validate_results_extracts_ids_from_nested_raw_body() -> None:
@@ -1080,6 +1365,9 @@ def test_runner_shell_contract_is_valid() -> None:
     assert 'gzip -1 <"$K6_PIPE"' in runner_text
     assert 'BENCHMARK_MAX_VUS="$MAX_K6_VUS"' in runner_text
     assert '--safety-output "$OUTPUT_DIR/safety-stop.json"' in runner_text
+    marker_cleanup = runner_text.index('rm -f "$OUTPUT_DIR/safety-stop.json"')
+    assert marker_cleanup < runner_text.index("collect_metrics.py")
+    assert marker_cleanup < runner_text.index('wait "$LOAD_PID"')
     assert runner_text.index("VALIDATOR_PID=$!") < runner_text.index("k6 run")
     assert 'if [[ "$EXTERNAL_SERVER" -eq 0 ]]' in runner_text
     assert "`bench-${runId}-${__VU}-${__ITER}-${Date.now()}`" in load_text
@@ -1089,6 +1377,46 @@ def test_runner_shell_contract_is_valid() -> None:
     assert "tags:" not in load_text
     assert "requestCount.add(1," not in load_text
     assert "requestLatency.add(response.timings.duration," not in load_text
+
+
+def test_runner_ignores_a_stale_safety_marker(tmp_path: Path) -> None:
+    """Reusing an output dir must not resurrect a previous run's safety stop.
+
+    k6, curl, and python3 are PATH shims, so this exercises the runner's own
+    control flow rather than a real load run.
+    """
+    runner = SINGLE_RUN_DIR / "run.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for tool in ("k6", "curl", "python3"):
+        shim = fake_bin / tool
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+    output = tmp_path / "reused"
+    output.mkdir()
+    marker = output / "safety-stop.json"
+    marker.write_text('{"reason": "stale"}\n', encoding="utf-8")
+    result = subprocess.run(
+        [
+            "bash",
+            str(runner),
+            "--external-server",
+            "--output-dir",
+            str(output),
+            "--duration",
+            "1",
+            "--qps",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "safety guard stopped" not in result.stderr
+    assert not marker.exists()
 
 
 def test_every_bpf_ring_reservation_failure_is_counted() -> None:
@@ -1904,6 +2232,70 @@ def test_aggregate_rows_deltas_and_partial_reports(tmp_path: Path) -> None:
     assert (tmp_path / "performance-comparison.csv").exists()
 
 
+def test_report_writers_survive_malformed_artifacts(tmp_path: Path) -> None:
+    """The fault and regression writers must tolerate the artifact shapes the
+    evidence gates tolerate: a malformed entry renders a placeholder instead
+    of raising and losing the whole report."""
+    run_path = tmp_path / "fault-run" / "run-result.json"
+    measurement = run_path.parent / "measurement"
+    measurement.mkdir(parents=True)
+    measurement.joinpath("fault-results.json").write_text(
+        json.dumps(
+            {
+                "outcomes": {
+                    "invalid_json": 3,
+                    "oversized_input": {"sent": True},
+                    "token_accuracy": {"handled": 2},
+                },
+                "server_healthy_after": True,
+                "sse_truncation_verified": True,
+                "process_alive_after": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    items = [
+        (
+            run_path,
+            {
+                "scenario": "fault",
+                "version": "baseline",
+                "summary": complete_summary(),
+            },
+        )
+    ]
+    results_by_version = aggregate_report.write_fault(
+        tmp_path,
+        items,
+        campaign_data(tmp_path)["fault"],
+        campaign_data(tmp_path)["thresholds"],
+    )
+    report = (tmp_path / "fault-report.md").read_text(encoding="utf-8")
+    assert "baseline" in report
+    assert "| 2 |" in report, "the usable case renders its counter total"
+    assert report.count("| — |") >= 2, "unusable cases render placeholders"
+    assert results_by_version["baseline"]["verdict"] == "INCONCLUSIVE"
+
+    (tmp_path / "regression.json").write_text(
+        json.dumps(
+            {
+                "checks": [
+                    {"command": "cargo test", "exit_code": 0},
+                    {"command": "cargo fmt", "exit_code": True},
+                    {"exit_code": 1},
+                    "cargo clippy",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    aggregate_report.write_regression(tmp_path)
+    report = (tmp_path / "regression-report.md").read_text(encoding="utf-8")
+    assert "`cargo test`" in report
+    assert "PASS" in report
+    assert report.count("| — | — | — |") == 3, "unusable checks render placeholders"
+
+
 def test_final_report_summarizes_headline_improvements(tmp_path: Path) -> None:
     items = []
     expected = {
@@ -2011,8 +2403,9 @@ def test_final_report_summarizes_headline_improvements(tmp_path: Path) -> None:
     assert comparison["metrics"]["rss_avg_mb"]["delta_pct"] == -20
     report = (tmp_path / "final-report.md").read_text(encoding="utf-8")
     assert "AgentSight baseline/optimized 全量测试报告" in report
-    assert "CPU 占用降低" in report
-    assert "内存占用降低" in report
+    assert "CPU 占用降低" not in report
+    assert "内存占用降低" not in report
+    assert result["optimization_claim_allowed"] is False
     assert "+50.00%" in report
     assert "-25.00%" in report
     assert "x86_64" in report
@@ -2066,6 +2459,36 @@ def test_regression_runner_records_command_result(tmp_path: Path) -> None:
     assert read_json["cargo_jobs"] is None
 
 
+def test_regression_runner_records_a_launch_failure(tmp_path: Path) -> None:
+    """An unrunnable check is recorded as a failure instead of aborting the run.
+
+    A missing executable is the canonical case here (the runner builds its
+    cargo checks from a toolchain path, and `rustup` absent means nothing
+    launches): `subprocess.run` raises before any record is appended, no
+    handler exists at the call site, and `write_report` runs only after the
+    first check — so the whole regression died with a traceback, wrote no
+    ``regression.json`` and skipped every later gate, the opposite of the
+    runner's preserve-all-logs contract.
+    """
+    checks: list[dict[str, object]] = []
+    missing = tmp_path / "definitely-not-a-real-tool"
+    log_path = tmp_path / "missing.log"
+
+    status = run_regression.run_check([str(missing)], tmp_path, log_path, checks)
+
+    assert status != 0
+    assert len(checks) == 1
+    assert checks[0]["exit_code"] != 0
+    assert checks[0]["command"] == str(missing)
+    # The failure evidence is preserved in the check's own log.
+    assert str(missing) in log_path.read_text(encoding="utf-8")
+    # The record is serializable, so a run that starts with an unrunnable check
+    # still publishes its report.
+    run_regression.write_report(tmp_path / "regression.json", checks)
+    published = json.loads((tmp_path / "regression.json").read_text())
+    assert published["checks"][0]["exit_code"] != 0
+
+
 def test_regression_progress_reports_coverage_and_log_path(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2114,8 +2537,9 @@ def test_regression_diff_reports_invalid_git_ref(
         run_regression.write_benchmark_diff("missing", tmp_path / "benchmark.diff")
 
 
+@pytest.mark.parametrize("interval", ["0", "-1", "nan", "inf"])
 def test_collect_metrics_cli_and_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interval: str
 ) -> None:
     output = tmp_path / "metrics.csv"
     collect_metrics.STOP = False
@@ -2152,27 +2576,23 @@ def test_collect_metrics_cli_and_stop(
             "--output",
             str(output),
             "--interval",
-            "0",
+            interval,
         ],
     )
-    with pytest.raises(SystemExit, match="interval must be positive"):
+    with pytest.raises(SystemExit, match="interval must be finite and positive"):
         collect_metrics.main()
 
 
 def test_collect_metrics_reports_each_resource_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        collect_metrics, "allocated_size", lambda _: 29 * collect_metrics.GIB
-    )
+    monkeypatch.setattr(collect_metrics, "allocated_size", lambda _: 29 * collect_metrics.GIB)
     monkeypatch.setattr(
         collect_metrics.shutil,
         "disk_usage",
         lambda _: SimpleNamespace(free=40 * collect_metrics.GIB),
     )
-    monkeypatch.setattr(
-        collect_metrics, "available_memory_bytes", lambda: 8 * collect_metrics.GIB
-    )
+    monkeypatch.setattr(collect_metrics, "available_memory_bytes", lambda: 8 * collect_metrics.GIB)
     arguments = (tmp_path, 100.0, 30, 5, 2048, 1536)
     assert collect_metrics.safety_violation(*arguments)["reason"] == "results_budget"
 
@@ -2301,6 +2721,7 @@ def test_fault_injector_main_writes_failure_safe_report(
         "inject",
         lambda *args: {
             "server_healthy_after": True,
+            "sse_truncation_verified": True,
             "process_alive_after": True,
             "outcomes": {},
         },
@@ -2559,6 +2980,7 @@ def test_full_scenario_reports_use_raw_artifacts(tmp_path: Path) -> None:
             "label": label,
             "version": "baseline",
             "repetition": 1,
+            "started_at_unix": 0,
             "summary": summary,
         }
         items.append((path, run))
@@ -2576,6 +2998,7 @@ def test_full_scenario_reports_use_raw_artifacts(tmp_path: Path) -> None:
             {
                 "outcomes": {"invalid_json": {"HTTP/1.1 200 OK": 2}},
                 "server_healthy_after": True,
+                "sse_truncation_verified": True,
                 "process_alive_after": True,
             }
         ),
@@ -2682,3 +3105,80 @@ def test_regression_main_builds_targeted_and_full_commands(
     assert workspace_test[workspace_test.index("--jobs") + 1] == "1"
     report = json.loads((tmp_path / "single-job/regression.json").read_text())
     assert report["cargo_jobs"] == 1
+
+
+@pytest.mark.parametrize(
+    ("samples", "window_seconds", "expected"),
+    [
+        pytest.param([], 300, None, id="empty"),
+        pytest.param([(0.0, 5.0)], 300, None, id="single"),
+        pytest.param(
+            [(0.0, 10.0), (1.0, 9.0), (2.0, 8.0)], 300, 0.0, id="decreasing"
+        ),
+        pytest.param([(0.0, 10.0), (100.0, 5.0)], 50, 0.0, id="evicted-decrease"),
+        pytest.param(
+            [(5.0, 3.0), (5.0, 1.0), (6.0, 2.0)], 1, 1.0, id="duplicate-times"
+        ),
+        pytest.param(
+            [(0.0, 10.0), (300.0, 1.0), (600.0, 5.0)],
+            300,
+            4.0,
+            id="inclusive-boundary",
+        ),
+        pytest.param([(0.0, 1.0), (1.0, 5.0)], 300, 4.0, id="basic"),
+        pytest.param(
+            [(0.0, 100.0), (10.0, 50.0), (20.0, 300.0)],
+            100,
+            250.0,
+            id="full-window",
+        ),
+        pytest.param(
+            [(0.0, 5.0), (0.0, 3.0), (1.0, 4.0)], 0, 0.0, id="zero-window"
+        ),
+        pytest.param(
+            [(0.0, 8.0), (1.0, 2.0), (2.0, 6.0), (400.0, 1.0), (401.0, 9.0)],
+            300,
+            8.0,
+            id="trough-later",
+        ),
+    ],
+)
+def test_rolling_max_increase_preserves_window_outcomes(
+    samples: list[tuple[float, float]], window_seconds: float, expected: float | None
+) -> None:
+    """Window outcomes match the values produced by the rescan baseline."""
+    assert benchmark_stats.rolling_max_increase(samples, window_seconds) == expected
+
+
+class _ComparisonCountingValue:
+    """Sample value that counts value comparisons during trend scans."""
+
+    __slots__ = ("value",)
+    comparisons = 0
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def __lt__(self, other: "_ComparisonCountingValue") -> bool:
+        type(self).comparisons += 1
+        return self.value < other.value
+
+    def __sub__(self, other: "_ComparisonCountingValue") -> float:
+        return self.value - other.value
+
+    def __rsub__(self, other: "_ComparisonCountingValue") -> float:
+        return other.value - self.value
+
+
+def test_rolling_max_increase_bounds_comparison_work() -> None:
+    """A monotonic-minimum deque keeps rolling scans linear in samples."""
+    size = 2000
+    samples = [
+        (float(second), _ComparisonCountingValue(second)) for second in range(size)
+    ]
+    _ComparisonCountingValue.comparisons = 0
+    result = benchmark_stats.rolling_max_increase(samples, 1000)
+    assert result == 1000
+    # The rescan baseline performs 1,499,500 value comparisons here; a
+    # monotonic minimum deque performs amortized constant work per sample.
+    assert _ComparisonCountingValue.comparisons <= 3 * size

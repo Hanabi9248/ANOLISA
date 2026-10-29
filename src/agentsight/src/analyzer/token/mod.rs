@@ -31,6 +31,8 @@ mod record;
 mod extractor;
 pub use extractor::extract_token_data_from_json;
 pub use extractor::openai::extract_response_content;
+pub(crate) use extractor::openai::merge_response_output_text;
+pub(crate) use extractor::openai::merge_response_tool_calls;
 
 // Re-export record types
 pub use record::TokenRecord;
@@ -162,12 +164,34 @@ pub fn extract_usage_object(
             (input.unwrap_or(0), output.unwrap_or(0))
         }
         LLMProvider::Gemini => {
-            let input = usage.get("prompt_token_count").and_then(|v| v.as_u64())?;
+            // The wire format is camelCase (`promptTokenCount` /
+            // `candidatesTokenCount` under `usageMetadata`); keep the
+            // snake_case spellings as a gateway fallback.
+            let input = usage
+                .get("promptTokenCount")
+                .or_else(|| usage.get("prompt_token_count"))
+                .and_then(|v| v.as_u64())?;
             let output = usage
-                .get("candidates_token_count")
+                .get("candidatesTokenCount")
+                .or_else(|| usage.get("candidates_token_count"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            (input, output)
+            // Thinking models bill their reasoning budget as output but report
+            // it in a counter of its own, outside `candidatesTokenCount`. A
+            // gemini-2.5 response looks like `{promptTokenCount: 10,
+            // candidatesTokenCount: 1, thoughtsTokenCount: 815,
+            // totalTokenCount: 826}`: reading only the candidate counter
+            // reports 1 output token for that call and breaks the
+            // reconciliation this module keeps everywhere else (`input + output
+            // == total`, asserted for DashScope below). Fold the thoughts in,
+            // the way OpenAI already ships reasoning inside `completion_tokens`
+            // and Anthropic inside `output_tokens`.
+            let thoughts = usage
+                .get("thoughtsTokenCount")
+                .or_else(|| usage.get("thoughts_token_count"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            (input, output.saturating_add(thoughts))
         }
         LLMProvider::DashScope => {
             // Native protocol reuses Anthropic's field names.
@@ -214,6 +238,9 @@ pub fn extract_usage_object(
     // may surface them at the top level as `cached_tokens`.
     // DashScope also nests `cache_creation_input_tokens` under
     // `prompt_tokens_details`, so we fall back there as well.
+    // Gemini reports hits as `cachedContentTokenCount`; like the OpenAI
+    // billing model the cached prefix is already inside `promptTokenCount`,
+    // so it is recorded but never added on top (TokenRecord::billed_input_tokens).
     let cache_creation_input_tokens = usage
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
@@ -238,12 +265,30 @@ pub fn extract_usage_object(
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
         })
+        .or_else(|| {
+            usage
+                .get("cachedContentTokenCount")
+                .and_then(|v| v.as_u64())
+        })
         .or_else(|| usage.get("cached_tokens").and_then(|v| v.as_u64()));
 
-    // Extract model name
+    // Extract model name. Anthropic nests it under `message` in
+    // `message_start`, the Responses protocol under `response` in its
+    // terminal event, and Gemini spells it `modelVersion`; none of those
+    // events carries a top-level `model`. The SSE enrichment reads the same
+    // pointers (genai::builder::extract_sse_enrichment), so without these
+    // fallbacks a streamed call was stored with an empty model while its
+    // drained twin kept it.
     let model = full_json
         .get("model")
         .and_then(|v| v.as_str())
+        .or_else(|| full_json.pointer("/message/model").and_then(|v| v.as_str()))
+        .or_else(|| {
+            full_json
+                .pointer("/response/model")
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| full_json.get("modelVersion").and_then(|v| v.as_str()))
         .map(|s| s.to_string());
 
     Some(TokenUsage {
@@ -285,6 +330,46 @@ pub(crate) fn merge_usage(acc: Option<TokenUsage>, next: TokenUsage) -> Option<T
         cur.provider = next.provider;
     }
     Some(cur)
+}
+
+/// Merge one parsed usage snapshot with its source event.
+///
+/// Anthropic-compatible streams can send preliminary counts in `message_start`
+/// and authoritative counts in the final `message_delta`. Preserve the
+/// cumulative max behavior for other fields and providers, but let an
+/// explicitly present Anthropic input/cache field replace the earlier value.
+pub(crate) fn merge_usage_from_event(
+    acc: Option<TokenUsage>,
+    next: TokenUsage,
+    event: &serde_json::Value,
+) -> Option<TokenUsage> {
+    let mut merged = merge_usage(acc, next)?;
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("message_delta") {
+        return Some(merged);
+    }
+
+    let Some(usage) = event.get("usage") else {
+        return Some(merged);
+    };
+    if let Some(input_tokens) = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        merged.input_tokens = input_tokens;
+    }
+    if let Some(cache_tokens) = usage
+        .get("cache_creation_input_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        merged.cache_creation_input_tokens = Some(cache_tokens);
+    }
+    if let Some(cache_tokens) = usage
+        .get("cache_read_input_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        merged.cache_read_input_tokens = Some(cache_tokens);
+    }
+    Some(merged)
 }
 
 /// Max of two optional counters, preserving a value when only one is set.

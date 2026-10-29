@@ -5,7 +5,7 @@ pub(crate) use commands::{batch, require_batch_roots, with_key};
 
 use crate::ledger::Ledger;
 use crate::ledger::content::Content;
-use crate::ledger::storage::{Directory, MAX_RECORD_BYTES, missing, set_owner};
+use crate::ledger::storage::{Directory, EntryIdentity, MAX_RECORD_BYTES, missing, set_owner};
 use crate::scanner::{ScanTree, ScannerRegistry, requested_names, scan_entry};
 use crate::{
     DecisionAction, HashDiff, KeyStore, Manifest, ScanEntry, ScanStatus, SigningIdentity,
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 /// Trusted mapping produced by the daemon's configured resolver, never decoded from RPC parameters.
@@ -130,39 +130,33 @@ pub struct ScanOptions {
 
 /// One daemon-owned service, shared by CLI actions and background actors.
 pub struct SkillSecService {
-    pub(crate) config: SkillSecConfig,
+    pub(crate) config: Mutex<SkillSecConfig>,
+    config_path: Option<PathBuf>,
     pub(crate) registry: ScannerRegistry,
-    pub(crate) generation: RwLock<()>,
+    key_initialization: Mutex<()>,
     pub(crate) active_requests: std::sync::atomic::AtomicUsize,
     locks: Mutex<BTreeMap<SkillIdentity, Weak<Mutex<()>>>>,
-    managed: Mutex<BTreeSet<SkillIdentity>>,
 }
 
 impl SkillSecService {
     /// Opens explicitly provisioned private state without initializing or replacing a key.
     ///
     /// # Errors
-    /// Rejects unsafe state paths, permissions and malformed persisted registration.
+    /// Rejects unsafe state paths and permissions.
     pub fn new(config: SkillSecConfig, registry: ScannerRegistry) -> Result<Self, SkillSecError> {
         config.validate()?;
-        KeyStore::open(&config.state_dir)?;
-        let directory = Directory::open(&config.state_dir)?;
-        let managed: BTreeSet<SkillIdentity> = match directory.read(
-            "managed-skills.json",
-            MAX_RECORD_BYTES,
-            Instant::now() + Duration::from_secs(5),
-        ) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if missing(&e) => BTreeSet::new(),
-            Err(e) => return Err(e),
-        };
+        let key_store = KeyStore::open(&config.state_dir)?;
+        // Crash recovery, once per process: an interrupted initialize can strand a full private key in a `.key-` temporary that
+        // nothing else reclaims. The sweep is age-guarded, so it never races
+        // a concurrent initializer's in-flight temporary.
+        key_store.reclaim_temporaries(Instant::now() + Duration::from_secs(5))?;
         Ok(Self {
-            config,
+            config: Mutex::new(config),
+            config_path: None,
             registry,
-            generation: RwLock::new(()),
+            key_initialization: Mutex::new(()),
             active_requests: std::sync::atomic::AtomicUsize::new(0),
             locks: Mutex::new(BTreeMap::new()),
-            managed: Mutex::new(managed),
         })
     }
 
@@ -177,25 +171,10 @@ impl SkillSecService {
     /// Initializes keys within the caller deadline, without replacing current trust.
     ///
     /// # Errors
-    /// Rejects unsafe keys, pending rotation and exhausted deadlines.
+    /// Rejects unsafe keys and exhausted deadlines.
     pub fn initialize_with_deadline(&self, deadline: Instant) -> Result<Value, SkillSecError> {
-        {
-            let _generation = self.generation_read(deadline)?;
-            self.require_no_rotation(deadline)?;
-            match KeyStore::open(&self.config.state_dir)?.load() {
-                Ok(key) => {
-                    return Ok(
-                        json!({"initialized":true,"keyFingerprint":key.fingerprint(),"keyCreated":false}),
-                    );
-                }
-                Err(error) if missing(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        // Release the read guard before acquiring exclusive access; another caller may create it.
-        let _generation = self.generation_write(deadline)?;
-        self.require_no_rotation(deadline)?;
-        let store = KeyStore::open(&self.config.state_dir)?;
+        let _initialization = timed_lock(&self.key_initialization, deadline)?;
+        let store = KeyStore::open(&self.config()?.state_dir)?;
         let created = match store.load() {
             Ok(_) => false,
             Err(error) if missing(&error) => true,
@@ -205,18 +184,18 @@ impl SkillSecService {
         Ok(json!({"initialized":true,"keyFingerprint":key.fingerprint(),"keyCreated":created}))
     }
 
-    /// Previously recorded exact roots, used for recovery, never as an authorization source.
+    /// Uses the same system configuration file loaded by daemon composition for exact-path memory.
     ///
     /// # Errors
-    /// Reports a poisoned service registry.
-    pub fn managed_skills(&self) -> Result<Vec<SkillIdentity>, SkillSecError> {
-        Ok(self
-            .managed
-            .lock()
-            .map_err(|_| poisoned())?
-            .iter()
-            .cloned()
-            .collect())
+    /// Rejects invalid absolute configuration paths.
+    pub fn with_config_path(mut self, path: PathBuf) -> Result<Self, SkillSecError> {
+        SkillIdentity::new(&path)?;
+        self.config_path = Some(path);
+        Ok(self)
+    }
+
+    pub(crate) fn config(&self) -> Result<SkillSecConfig, SkillSecError> {
+        Ok(self.config.lock().map_err(|_| poisoned())?.clone())
     }
 
     /// Configured scanner inventory for CLI discovery and status.
@@ -254,6 +233,8 @@ impl SkillSecService {
             self.recover_rollback(root, directory, key, deadline)?;
             validate_skill(directory)?;
             let ledger = required_ledger(directory)?;
+            // Preserve a complete signed commit interrupted before latest.json publication.
+            ledger.repair_latest(key, &root.identity, deadline)?;
             let content = Content::capture(directory, false, deadline)?;
             let original = ScanTree::open(&root.io_dir, deadline)?;
             let (mut manifest, state, new_version) =
@@ -267,12 +248,12 @@ impl SkillSecService {
                 .collect();
             if to_run.is_empty() {
                 content.unchanged(directory, &original, deadline)?;
-                let mut result = self.noop(root, &manifest, requested)?;
+                let mut result = self.noop(root, &manifest, requested, deadline);
                 result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
                 return Ok(result);
             }
             let (staging_dir, tree) =
-                content.scan_tree(&self.config.state_dir, &original, deadline)?;
+                content.scan_tree(&self.config()?.state_dir, &original, deadline)?;
             let mut entries = self.registry.scan_tree(&tree, &to_run, deadline)?;
             if entries.is_empty() {
                 if new_version {
@@ -281,7 +262,7 @@ impl SkillSecService {
                     ));
                 }
                 content.unchanged(directory, &original, deadline)?;
-                let mut result = self.noop(root, &manifest, &to_run)?;
+                let mut result = self.noop(root, &manifest, &to_run, deadline);
                 result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
                 return Ok(result);
             }
@@ -292,13 +273,13 @@ impl SkillSecService {
             ledger.commit(&manifest, &content, new_version, deadline, || {
                 content.unchanged(directory, &original, deadline)
             })?;
-            self.remember(&root.identity)?;
             let skipped: Vec<_> = requested
                 .iter()
                 .filter(|name| !to_run.contains(name))
                 .cloned()
                 .collect();
             let mut result = scan_payload(&manifest, new_version, &scanners_run, "scanned");
+            self.remember(root, &mut result, deadline);
             result["skippedScanners"] = json!(skipped);
             recovery_event(&mut result, state, "scan", &manifest, &scanners_run);
             result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
@@ -339,12 +320,12 @@ impl SkillSecService {
             ledger.commit(&manifest, &content, new_version, deadline, || {
                 content.unchanged(directory, &original, deadline)
             })?;
-            self.remember(&root.identity)?;
             let scanners_run = vec![scanner.to_owned()];
             let mut result = scan_payload(&manifest, new_version, &scanners_run, "scanned");
             if !parsed.warnings.is_empty() {
                 result["warnings"] = json!(parsed.warnings);
             }
+            self.remember(root, &mut result, deadline);
             recovery_event(&mut result, state, "certify", &manifest, &scanners_run);
             result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
             Ok(result)
@@ -372,7 +353,7 @@ impl SkillSecService {
                 Err(SkillSecError::Timeout) => return Err(SkillSecError::Timeout),
                 _ => {}
             }
-            let key = KeyStore::open(&self.config.state_dir)?.load()?;
+            let key = KeyStore::open(&self.config()?.state_dir)?.load()?;
             check_locked(directory, &key, root, deadline)
         })
     }
@@ -391,7 +372,7 @@ impl SkillSecService {
             validate_skill(directory)?;
             match Ledger::open(directory, false)? {
                 Some(ledger) if ledger_has_history(&ledger, deadline)? => {
-                    let key = KeyStore::open(&self.config.state_dir)?.load()?;
+                    let key = KeyStore::open(&self.config()?.state_dir)?.load()?;
                     ledger.audit(&key, &root.identity, verify_snapshots, deadline)
                 }
                 _ => Ok(json!({"canonicalSkillDir":root.identity,"skillName":root.identity.name(),"valid":true,"versions_checked":0,"errors":[],"message":"No versions found — nothing to audit"})),
@@ -415,7 +396,7 @@ impl SkillSecService {
         deadline: Instant,
     ) -> Result<Value, SkillSecError> {
         SkillIdentity::new(output)?;
-        if output.starts_with(&root.io_dir) || output.starts_with(&self.config.state_dir) {
+        if output.starts_with(&root.io_dir) || output.starts_with(&self.config()?.state_dir) {
             return Err(SkillSecError::Invalid(
                 "export must be outside Skill and daemon state".into(),
             ));
@@ -446,18 +427,51 @@ impl SkillSecService {
                 ledger.latest(key, &root.identity, true, deadline)?.ok_or_else(|| SkillSecError::Integrity("Skill has no latest version".into()))?
             } else { ledger.version(selector, key, &root.identity, deadline)? };
             let content = ledger.snapshot(&manifest, deadline)?;
-            let snapshot = destination.fresh_child("snapshot")?;
-            content.write_owned(&snapshot, deadline, Some(caller_uid))?;
-            if Content::capture(&snapshot, true, deadline)?.hashes() != manifest.file_hashes {
-                return Err(SkillSecError::Integrity("export content changed during creation".into()));
+            // Artifacts this invocation created, paired with the filesystem
+            // identity observed at creation. The cleanup below removes only
+            // entries still carrying a recorded identity: a competing export
+            // that raced past the empty-destination check owns the names it
+            // created (fresh_child and the NOREPLACE write_atomic fail with
+            // EEXIST instead of claiming them), so its output — partial or
+            // complete — is never deleted by this call's error path.
+            let mut created: Vec<(&'static str, EntryIdentity)> = Vec::new();
+            let outcome = (|| {
+                let snapshot = destination.fresh_child("snapshot")?;
+                if let Ok(identity) = EntryIdentity::of(&snapshot.file, &snapshot.path) {
+                    created.push(("snapshot", identity));
+                }
+                content.write_owned(&snapshot, deadline, Some(caller_uid))?;
+                if Content::capture(&snapshot, true, deadline)?.hashes() != manifest.file_hashes {
+                    return Err(SkillSecError::Integrity("export content changed during creation".into()));
+                }
+                let record = destination.write_atomic("manifest.json", &serde_json::to_vec(&manifest)?, false)?;
+                if let Ok(identity) = EntryIdentity::of(&record, &output.join("manifest.json")) {
+                    created.push(("manifest.json", identity));
+                }
+                set_owner(&record, caller_uid, &output.join("manifest.json"))?;
+                let report = destination.write_atomic("findings.json", &serde_json::to_vec(&findings(&manifest))?, false)?;
+                if let Ok(identity) = EntryIdentity::of(&report, &output.join("findings.json")) {
+                    created.push(("findings.json", identity));
+                }
+                set_owner(&report, caller_uid, &output.join("findings.json"))?;
+                destination.verify_path()?;
+                Ok(json!({"canonicalSkillDir":root.identity,"skillName":root.identity.name(),"versionId":manifest.version_id,
+                    "output":output,"snapshot":output.join("snapshot"),"manifest":output.join("manifest.json"),"findings":output.join("findings.json")}))
+            })();
+            if outcome.is_err() {
+                // A failed export must not leave a partial tree that blocks
+                // the same --output with the "must be empty" guard. Removals
+                // go through the pinned directory handle, so they clean up
+                // the entries this call created even if the path was swapped;
+                // each removal is identity-checked so artifacts owned by a
+                // competing writer survive, and failures are swallowed so the
+                // original error is returned.
+                let cleanup = Instant::now() + Duration::from_secs(5);
+                while let Some((name, identity)) = created.pop() {
+                    let _ = destination.remove_child_if_same(name, &identity, cleanup);
+                }
             }
-            let record = destination.write_atomic("manifest.json", &serde_json::to_vec(&manifest)?, false)?;
-            set_owner(&record, caller_uid, &output.join("manifest.json"))?;
-            let report = destination.write_atomic("findings.json", &serde_json::to_vec(&findings(&manifest))?, false)?;
-            set_owner(&report, caller_uid, &output.join("findings.json"))?;
-            destination.verify_path()?;
-            Ok(json!({"canonicalSkillDir":root.identity,"skillName":root.identity.name(),"versionId":manifest.version_id,
-                "output":output,"snapshot":output.join("snapshot"),"manifest":output.join("manifest.json"),"findings":output.join("findings.json")}))
+            outcome
         })
     }
 
@@ -480,7 +494,7 @@ impl SkillSecService {
         operation: impl FnOnce(&Directory, &SigningIdentity) -> Result<T, SkillSecError>,
     ) -> Result<T, SkillSecError> {
         self.with_locked_directory(root, deadline, |directory| {
-            let key = KeyStore::open(&self.config.state_dir)?.load()?;
+            let key = KeyStore::open(&self.config()?.state_dir)?.load()?;
             operation(directory, &key)
         })
     }
@@ -491,14 +505,10 @@ impl SkillSecService {
         deadline: Instant,
         operation: impl FnOnce(&Directory) -> Result<T, SkillSecError>,
     ) -> Result<T, SkillSecError> {
-        let generation = self.generation_read(deadline)?;
-        self.require_no_rotation(deadline)?;
         let lock = self.skill_lock(&root.identity)?;
         let _guard = timed_lock(&lock, deadline)?;
         let directory = root.open_verified()?;
-        let result = operation(&directory);
-        drop(generation);
-        result
+        operation(&directory)
     }
 
     fn skill_lock(&self, identity: &SkillIdentity) -> Result<Arc<Mutex<()>>, SkillSecError> {
@@ -512,19 +522,40 @@ impl SkillSecService {
         Ok(lock)
     }
 
-    fn remember(&self, identity: &SkillIdentity) -> Result<(), SkillSecError> {
-        let mut managed = self.managed.lock().map_err(|_| poisoned())?;
-        if !managed.contains(identity) {
-            let mut updated = managed.clone();
-            updated.insert(identity.clone());
-            Directory::open(&self.config.state_dir)?.write_atomic(
-                "managed-skills.json",
-                &serde_json::to_vec(&updated)?,
-                true,
-            )?;
-            *managed = updated;
+    fn remember(&self, root: &SkillRoot, result: &mut Value, deadline: Instant) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let saved = (|| {
+            let mut config = timed_lock(&self.config, deadline)?;
+            let exact = !root.host_backed;
+            let entry = crate::ManagedSkillDir::exact(&root.identity)?;
+            if config.managed_skill_dirs.iter().any(|pattern| {
+                if exact {
+                    pattern == &entry
+                } else {
+                    pattern.contains(&root.identity)
+                }
+            }) {
+                return Ok(());
+            }
+            for pattern in crate::config::remember(path, &root.identity, exact, deadline)? {
+                if !config.managed_skill_dirs.contains(&pattern) {
+                    config.managed_skill_dirs.push(pattern);
+                }
+            }
+            Ok::<_, SkillSecError>(())
+        })();
+        if let Err(error) = saved {
+            let warning =
+                format!("Skill was processed but managedSkillDirs could not be saved: {error}");
+            if !result["warnings"].is_array() {
+                result["warnings"] = json!([]);
+            }
+            if let Some(warnings) = result["warnings"].as_array_mut() {
+                warnings.push(json!(warning));
+            }
         }
-        Ok(())
     }
 
     fn noop(
@@ -532,11 +563,12 @@ impl SkillSecService {
         root: &SkillRoot,
         manifest: &Manifest,
         skipped: &[String],
-    ) -> Result<Value, SkillSecError> {
-        self.remember(&root.identity)?;
+        deadline: Instant,
+    ) -> Value {
         let mut result = scan_payload(manifest, false, &[], "noop");
         result["skippedScanners"] = json!(skipped);
-        Ok(result)
+        self.remember(root, &mut result, deadline);
+        result
     }
 }
 
