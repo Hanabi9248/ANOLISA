@@ -17,6 +17,7 @@ on:
       - 'scripts/docs-lint.sh'
       - '.github/docs-lint-exemptions.txt'
       - 'scripts/docs-link-check.py'
+      - 'tests/test_docs_link_references.py'
       - '.github/workflows/docs-lint.yml'
 
 permissions:
@@ -31,6 +32,9 @@ jobs:
 
       - name: Naming convention + en/zh tree parity
         run: bash scripts/docs-lint.sh
+
+      - name: Reference link CLI regressions
+        run: python3 -m unittest discover -s tests -p 'test_docs_link_references.py'
 
       - name: Relative link check
         run: python3 scripts/docs-link-check.py
