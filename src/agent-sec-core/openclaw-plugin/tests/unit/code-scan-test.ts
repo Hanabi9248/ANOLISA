@@ -665,4 +665,57 @@ describe("scan-code", () => {
       assert.equal(result, undefined);
     });
   });
+  describe("native plugins self-protection", () => {
+
+    it("matches host trimming and preserves explicit target precedence", async () => {
+      const { handler } = registerAndGetHandler();
+      for (const params of [
+        { action: " disable ", pluginId: " agent-sec " },
+        { action: "uninstall", plugin_id: "agent-sec" },
+      ]) {
+        assert.equal((await handler({ toolName: "plugins", params }, {}))?.block, true);
+      }
+      for (const params of [
+        { action: "disable", pluginId: "other-plugin", plugin_id: "agent-sec" },
+        { action: "disable", pluginId: undefined, plugin_id: "agent-sec" },
+        { action: "Disable", pluginId: "agent-sec" },
+        { action: "disable", pluginId: "AGENT-SEC" },
+      ]) {
+        assert.equal(await handler({ toolName: "plugins", params }, {}), undefined);
+      }
+    });
+    for (const action of ["disable", "uninstall"]) {
+      it(`blocks native ${action} without a shell scanner`, async () => {
+        const { handler, logs } = registerAndGetHandler();
+        let calls = 0;
+        _setCliMock(async () => { calls++; throw new Error("Unexpected CLI"); });
+        const event = { toolName: "plugins", params: { action, pluginId: "agent-sec" } };
+        const result = await handler(event, { runId: "native-run" });
+        assert.equal(result?.block, true);
+        assert.equal(calls, 0);
+        const record = JSON.parse(logs.find(line => line.startsWith("[scan-code] "))!.slice(12));
+        assert.equal(record.decision, "block");
+        assert.equal(record.run_id, "native-run");
+        assert.deepEqual(event, { toolName: "plugins", params: { action, pluginId: "agent-sec" } });
+      });
+    }
+    it("preserves other targets, ordinary actions and disabled hooks", async () => {
+      const { handler } = registerAndGetHandler();
+      for (const params of [
+        { action: "disable", pluginId: "other-plugin" },
+        { action: "uninstall", pluginId: "agent-sec-memory" },
+        { action: "enable", pluginId: "agent-sec" },
+        { action: "inspect", pluginId: "agent-sec" },
+        { action: "disable", name: "agent-sec" },
+      ]) {
+        assert.equal(await handler({ toolName: "plugins", params }, {}), undefined);
+      }
+      process.env.CODE_SCANNER_HOOK_ENABLED = "false";
+      const disabled = registerAndGetHandler();
+      assert.equal(await disabled.handler({
+        toolName: "plugins", params: { action: "disable", pluginId: "agent-sec" },
+      }, {}), undefined);
+    });
+  });
+
 });

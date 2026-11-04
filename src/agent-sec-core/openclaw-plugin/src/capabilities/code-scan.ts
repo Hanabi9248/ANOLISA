@@ -51,6 +51,19 @@ export const codeScan: SecurityCapability = {
           return undefined;
         }
 
+        // Match native trimmed strings and explicit pluginId precedence.
+        const nativeParams = event.params ?? {};
+        const nativeAction = typeof nativeParams.action === "string" ? nativeParams.action.trim() : undefined;
+        const nativeTarget = Object.hasOwn(nativeParams, "pluginId") ? nativeParams.pluginId : nativeParams.plugin_id;
+        if (event.toolName === "plugins" &&
+            (nativeAction === "disable" || nativeAction === "uninstall") &&
+            typeof nativeTarget === "string" && nativeTarget.trim() === "agent-sec") {
+          report("warn", `SELF-PROTECT block — native plugins ${nativeAction} agent-sec`, {
+            outcome: "self-protect-native", verdict: "warn", decision: "block",
+          });
+          return { block: true, blockReason: "[agent-sec-core] 自我保护：该操作将禁用或卸载 agent-sec 安全插件。请由用户手动执行该操作。" };
+        }
+
         // 只拦截 shell 类工具
         const command = extractCommand(event);
         if (!command) {
