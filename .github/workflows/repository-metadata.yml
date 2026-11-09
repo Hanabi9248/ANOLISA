@@ -14,6 +14,7 @@ on:
       - ".github/scripts/test_validate_repository_metadata.py"
       - ".github/scripts/test_package_source_paths.py"
       - ".github/scripts/test_release_notes.py"
+      - ".github/scripts/test_release_notes_indent_cli.py"
       - ".github/scripts/generate_release_notes.py"
       - ".github/actions/package-source/action.yaml"
       - ".github/scripts/issue-claim.js"
@@ -48,6 +49,7 @@ on:
       - ".github/scripts/test_validate_repository_metadata.py"
       - ".github/scripts/test_package_source_paths.py"
       - ".github/scripts/test_release_notes.py"
+      - ".github/scripts/test_release_notes_indent_cli.py"
       - ".github/scripts/generate_release_notes.py"
       - ".github/actions/package-source/action.yaml"
       - ".github/scripts/issue-claim.js"
@@ -96,7 +98,9 @@ jobs:
         run: python3 .github/scripts/test_package_source_paths.py
 
       - name: Test automatic release notes
-        run: python3 -B .github/scripts/test_release_notes.py
+        run: |
+          python3 -B .github/scripts/test_release_notes.py
+          python3 -B .github/scripts/test_release_notes_indent_cli.py
 
   community-automation:
     name: Test community automation

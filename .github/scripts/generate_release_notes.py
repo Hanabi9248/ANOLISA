@@ -83,7 +83,7 @@ def changelog_entry(text: str, version: str) -> str:
         )
     index = matches[0]
     end = headings[index + 1][0] if index + 1 < len(headings) else len(text)
-    body = text[headings[index][1] : end].strip()
+    body = text[headings[index][1] : end].strip("\r\n")
     visible = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
     visible = re.sub(r"(?m)^#{1,6}[ \t]+.*$|^\[[^\]]+\]:.*$|^(?:[-*_][ \t]*){3,}$", "", visible)
     if not visible.strip():
