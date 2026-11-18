@@ -1,0 +1,40 @@
+{
+  "base": "72e3c948a1efb88a257386151bad4cbb816022b1",
+  "old_pr_head": "3ca3495ad91db01068e7c3011f758f3365141819",
+  "formal_files": [
+    {
+      "path": "src/os-skills/ai/setup-mcp/scripts/validate_mcp.py",
+      "sha256": "22f687c1a274939e759de0285f8bb775046d6e5bd0f3da4900a341c069038e0e",
+      "new_blob": "6017c7f445f1c7fd5424f47e20aa719afbd04f8c"
+    },
+    {
+      "path": "src/os-skills/ai/setup-mcp/SKILL.md",
+      "sha256": "a465377a256c45e3e4ea11cf144643df1fa1e74d81af8db1ed9a0773e0cc4c95",
+      "new_blob": "39ff20966b7ab06bc6a00c885717aaec16d2605a"
+    },
+    {
+      "path": "src/os-skills/tests/test_mcp_unicode_stdout.py",
+      "sha256": "0253fe428d7a2c649cebe091fdd283bebed7a21ef1122558061823d10b959f7c",
+      "new_blob": "7de181ddcabe67932e2a74a796f4c60b3dff4bb1"
+    },
+    {
+      "path": "src/os-skills/tests/test_mcp_stdout_error_policy.py",
+      "sha256": "df4c65b6afb978607dab5fb675b9df6489e4ceebe67465d04154726496d2ee8a",
+      "new_blob": "57d1acd458a89a66081cd83093f6e05e582161b3"
+    }
+  ],
+  "actions": {
+    "checkout": {
+      "tag": "v7.0.1",
+      "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    },
+    "setup-python": {
+      "tag": "v7.1.0",
+      "sha": "6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+    },
+    "upload-artifact": {
+      "tag": "v7.0.2",
+      "sha": "cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+    }
+  }
+}

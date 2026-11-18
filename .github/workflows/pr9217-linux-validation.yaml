@@ -1,0 +1,52 @@
+name: PR9217 fork Linux acceptance
+
+on:
+  push:
+    branches: ['codex/mcp-linux-validation']
+
+permissions:
+  contents: read
+
+jobs:
+  mcp:
+    if: github.repository == 'Hanabi9248/ANOLISA'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+          check-latest: false
+      - name: Run exact Linux acceptance inside capped cgroup
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/pr9217-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$evidence/tmp" "$evidence/results"
+          python="$(command -v python)"
+          cpu="$("$python" -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          sudo -n systemd-run --wait --pipe --collect \
+            --unit="pr9217-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+            -p "CPUAffinity=$cpu" -p MemoryMax=805306368 \
+            -p MemorySwapMax=0 -p TasksMax=16 -p RuntimeMaxSec=600 \
+            /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
+            "PR9217_EVIDENCE=$evidence/results" \
+            "TMPDIR=$evidence/tmp" "TMP=$evidence/tmp" "TEMP=$evidence/tmp" \
+            PYTHONDONTWRITEBYTECODE=1 PYTHONIOENCODING=utf-8 \
+            OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+            NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+            "$python" "$GITHUB_WORKSPACE/_validation/pr9217/verify_linux.py"
+      - name: Retain exact acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr9217-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/pr9217-${{ github.run_id }}-${{ github.run_attempt }}/results/
+          if-no-files-found: warn
+          retention-days: 7
