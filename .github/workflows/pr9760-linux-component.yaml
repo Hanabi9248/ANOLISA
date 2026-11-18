@@ -55,7 +55,7 @@ jobs:
             /usr/bin/env "PATH=$PATH" "HOME=$evidence/home" "LANG=C.UTF-8" \
             "TMPDIR=$evidence/tmp" "TMP=$evidence/tmp" "TEMP=$evidence/tmp" \
             "PR9760_OUTPUT=$evidence/results" "PR9760_WORKFLOW_SHA=$GITHUB_SHA" \
-            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=$evidence/home/.cargo" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_TOOLCHAIN=1.91.0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 \
             RAYON_NUM_THREADS=1 UV_THREADPOOL_SIZE=1 PYTHONDONTWRITEBYTECODE=1 \
             OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
