@@ -88,11 +88,11 @@ def main():
     for entry in manifest['formal_files']:
         raw = (ROOT / entry['path']).read_bytes()
         assert hashlib.sha256(raw).hexdigest() == entry['sha256'], entry['path']
-    subprocess.run(['git', 'merge-base', '--is-ancestor', manifest['base'], 'HEAD'], check=True)
-    subprocess.run(['git', 'diff', '--exit-code'], check=True)
+    subprocess.run(['git', '-c', 'core.preloadIndex=false', '-c', 'index.threads=1', 'merge-base', '--is-ancestor', manifest['base'], 'HEAD'], check=True)
+    subprocess.run(['git', '-c', 'core.preloadIndex=false', '-c', 'index.threads=1', 'diff', '--exit-code'], check=True)
     candidate = SCRIPT.read_bytes()
     assert candidate.count(FIX) == 1
-    summary = {'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+    summary = {'head': subprocess.check_output(['git', '-c', 'core.preloadIndex=false', '-c', 'index.threads=1', 'rev-parse', 'HEAD'], text=True).strip(),
                'base': manifest['base'], 'resources': environment}
     try:
         positive = run_phase('candidate')
@@ -115,8 +115,8 @@ def main():
         SCRIPT.write_bytes(candidate)
         summary['restored'] = SCRIPT.read_bytes() == candidate
         (OUTPUT / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
-    subprocess.run(['git', 'diff', '--exit-code'], check=True)
-    assert not subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all']).strip()
+    subprocess.run(['git', '-c', 'core.preloadIndex=false', '-c', 'index.threads=1', 'diff', '--exit-code'], check=True)
+    assert not subprocess.check_output(['git', '-c', 'core.preloadIndex=false', '-c', 'index.threads=1', 'status', '--porcelain', '--untracked-files=all']).strip()
     summary['clean_checkout_after'] = True
     (OUTPUT / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(json.dumps(summary, indent=2), flush=True)
