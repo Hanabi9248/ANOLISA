@@ -1,0 +1,88 @@
+name: PR9760 fork Linux component gates
+
+on:
+  push:
+    branches: ['codex/tokenless-envfix-linux-component']
+
+permissions:
+  contents: read
+
+jobs:
+  tokenless:
+    if: github.repository == 'Hanabi9248/ANOLISA'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 58
+    steps:
+      - name: Create evidence directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/pr9760-component-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$evidence/home" "$evidence/tmp" "$evidence/results"
+          printf 'COMPONENT_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: python
+        with:
+          python-version: '3.11'
+          check-latest: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        id: node
+        with:
+          node-version: '20'
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6 # v2
+        id: just
+      - name: Run build, lint and test in a capped non-root cgroup
+        id: gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$COMPONENT_EVIDENCE"
+          exec > >(tee "$evidence/results/launcher.log") 2>&1
+          git merge-base --is-ancestor 3af2dc671b5edd6a27d78056f308ecea7c2d6b49 HEAD
+          python="$(command -v python)"
+          cpu="$("$python" -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          sudo -n systemd-run --wait --pipe --collect \
+            --unit="pr9760-gates-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            -p "WorkingDirectory=$GITHUB_WORKSPACE" -p "CPUAffinity=$cpu" \
+            -p MemoryMax=805306368 -p MemorySwapMax=0 -p TasksMax=16 -p RuntimeMaxSec=3240 \
+            -p NoNewPrivileges=yes \
+            /usr/bin/env "PATH=$PATH" "HOME=$evidence/home" "LANG=C.UTF-8" \
+            "TMPDIR=$evidence/tmp" "TMP=$evidence/tmp" "TEMP=$evidence/tmp" \
+            "PR9760_OUTPUT=$evidence/results" "PR9760_WORKFLOW_SHA=$GITHUB_SHA" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=$evidence/home/.cargo" \
+            RUSTUP_TOOLCHAIN=1.91.0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 \
+            RAYON_NUM_THREADS=1 UV_THREADPOOL_SIZE=1 PYTHONDONTWRITEBYTECODE=1 \
+            OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+            NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+            GIT_CONFIG_COUNT=4 GIT_CONFIG_KEY_0=index.threads GIT_CONFIG_VALUE_0=1 \
+            GIT_CONFIG_KEY_1=core.preloadIndex GIT_CONFIG_VALUE_1=false \
+            GIT_CONFIG_KEY_2=pack.threads GIT_CONFIG_VALUE_2=1 \
+            GIT_CONFIG_KEY_3=checkout.workers GIT_CONFIG_VALUE_3=1 \
+            /usr/bin/bash "$GITHUB_WORKSPACE/_validation/pr9760/component_gates.sh"
+      - name: Record workflow setup outcomes
+        if: always()
+        shell: bash
+        env:
+          CHECKOUT: ${{ steps.checkout.outcome }}
+          PYTHON: ${{ steps.python.outcome }}
+          NODE: ${{ steps.node.outcome }}
+          JUST: ${{ steps.just.outcome }}
+          GATES: ${{ steps.gates.outcome }}
+        run: |
+          set -euo pipefail
+          printf 'checkout=%s\npython=%s\nnode=%s\njust=%s\ngates=%s\n' \
+            "$CHECKOUT" "$PYTHON" "$NODE" "$JUST" "$GATES" > "$COMPONENT_EVIDENCE/results/workflow-outcomes.txt"
+      - name: Retain component logs and cgroup evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr9760-component-gates-${{ github.sha }}
+          path: ${{ runner.temp }}/pr9760-component-${{ github.run_id }}-${{ github.run_attempt }}/results/
+          if-no-files-found: warn
+          retention-days: 7
