@@ -50,6 +50,9 @@ run_stage() {
   fi
 }
 
+# Use the installed toolchain directly; private CARGO_HOME has no rustup shims.
+export PATH="$RUSTUP_HOME/toolchains/1.91.0-x86_64-unknown-linux-gnu/bin:$PATH"
+
 run_stage setup 360s bash -euc '
   uname -r
   python3 --version
