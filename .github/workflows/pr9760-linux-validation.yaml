@@ -1,0 +1,55 @@
+name: PR9760 fork Linux regression
+
+on:
+  push:
+    branches: ['codex/tokenless-envfix-linux-validation']
+
+permissions:
+  contents: read
+
+jobs:
+  env-fix:
+    if: github.repository == 'Hanabi9248/ANOLISA'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+          check-latest: false
+      - name: Run exact Tokenless regression under Linux resource limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/pr9760-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$evidence/home" "$evidence/tmp" "$evidence/results"
+          test "$(git rev-parse HEAD^)" = 3af2dc671b5edd6a27d78056f308ecea7c2d6b49
+          git show 5a113912348aa2484c793cf1a52bd31f69d0c3b2:src/tokenless/adapters/tokenless/common/tokenless-env-fix.sh > "$evidence/tmp/baseline.sh"
+          python="$(command -v python)"
+          cpu="$("$python" -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          sudo -n systemd-run --wait --pipe --collect \
+            --unit="pr9760-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            -p "WorkingDirectory=$GITHUB_WORKSPACE" -p "CPUAffinity=$cpu" \
+            -p MemoryMax=805306368 -p MemorySwapMax=0 -p TasksMax=16 -p RuntimeMaxSec=300 \
+            -p NoNewPrivileges=yes -p PrivateNetwork=yes -p ProtectSystem=strict \
+            -p "ReadWritePaths=$evidence" \
+            /usr/bin/env "PATH=$PATH" "HOME=$evidence/home" "LANG=C.UTF-8" \
+            "TMPDIR=$evidence/tmp" "TMP=$evidence/tmp" "TEMP=$evidence/tmp" \
+            "PR9760_EVIDENCE=$evidence" "PR9760_WORKFLOW_SHA=$GITHUB_SHA" \
+            PYTHONDONTWRITEBYTECODE=1 PYTHONIOENCODING=utf-8 \
+            OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+            NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+            "$python" "$GITHUB_WORKSPACE/_validation/pr9760/verify_linux.py"
+      - name: Retain logs and resource evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr9760-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/pr9760-${{ github.run_id }}-${{ github.run_attempt }}/results/
+          if-no-files-found: warn
+          retention-days: 7
