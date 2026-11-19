@@ -27,6 +27,7 @@ Baseline on unchanged main:
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,53 @@ class SessionLogsTestCase(unittest.TestCase):
 
 
 class TestLogDecoding(SessionLogsTestCase):
+    def run_file_codec_cli(self, output, utf8_mode):
+        return subprocess.run(
+            [
+                sys.executable, str(SCRIPT), "--logs-dir", str(self.logs_dir),
+                "--output", str(output),
+            ],
+            capture_output=True,
+            encoding="utf-8",
+            env=dict(
+                os.environ,
+                LC_ALL="C",
+                PYTHONCOERCECLOCALE="0",
+                PYTHONUTF8=utf8_mode,
+                PYTHONIOENCODING="utf-8",
+            ),
+            timeout=60,
+        )
+
+    def test_unicode_config_workspace_survives_non_utf8_locale(self):
+        workspace = "/fixtures/workspace-\u20ac"
+        config = {"agents": {"list": [{"id": "agent-1", "workspace": workspace}]}}
+        (self.logs_dir / "openclaw.json").write_text(
+            json.dumps(config, ensure_ascii=False), encoding="utf-8"
+        )
+        output = self.logs_dir / "config-report.json"
+        for utf8_mode in ("0", "1"):
+            with self.subTest(utf8_mode=utf8_mode):
+                proc = self.run_file_codec_cli(output, utf8_mode)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("Warning: Could not read config", proc.stdout)
+                self.assertIn(f"  agent-1: {workspace}", proc.stdout)
+                report = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(report["workspaces"], {"agent-1": workspace})
+
+    def test_unicode_session_workspace_is_written_as_utf8(self):
+        workspace = "/fixtures/workspace-\U0001f9ea"
+        self.write_log([json.dumps({"cwd": workspace}, ensure_ascii=False)])
+        output = self.logs_dir / "session-report.json"
+        for utf8_mode in ("0", "1"):
+            with self.subTest(utf8_mode=utf8_mode):
+                proc = self.run_file_codec_cli(output, utf8_mode)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(f"  agent-1: {workspace}", proc.stdout)
+                self.assertIn(workspace.encode("utf-8"), output.read_bytes())
+                report = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(report["workspaces"], {"agent-1": workspace})
+
     def test_non_utf8_records_are_skipped(self):
         workspace = self.logs_dir / "workspace-é"
         (workspace / "skills" / "web").mkdir(parents=True)

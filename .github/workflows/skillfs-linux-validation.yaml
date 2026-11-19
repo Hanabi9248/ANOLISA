@@ -1,0 +1,46 @@
+name: SkillFS bundled usage reports on Linux
+
+on:
+  push:
+    branches: ['codex/skillfs-linux-validation']
+
+permissions:
+  contents: read
+
+jobs:
+  bundled-usage:
+    if: github.repository == 'Hanabi9248/ANOLISA'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: |
+            _validation/issue10311
+            src/skillfs/docs/skills/skillfs-mount/scripts
+            src/skillfs/tests
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+          check-latest: false
+      - name: Run bundled usage tests and check UTF-8 report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          private_tmp="$(mktemp -d "$RUNNER_TEMP/skillfs-10311.XXXXXXXX")"
+          python="$(command -v python3)"
+          cpu="$("$python" -c 'import os; print(min(os.sched_getaffinity(0)))')"
+          sudo -n systemd-run --wait --pipe --collect \
+            --unit="skillfs-10311-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+            -p "CPUAffinity=$cpu" -p MemoryMax=805306368 \
+            -p MemorySwapMax=0 -p TasksMax=16 -p RuntimeMaxSec=480 \
+            /usr/bin/env "PATH=$PATH" "HOME=$HOME" \
+            "TMPDIR=$private_tmp" "TMP=$private_tmp" "TEMP=$private_tmp" \
+            LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONIOENCODING=utf-8 \
+            OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+            NUMEXPR_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+            "$python" _validation/issue10311/verify_linux.py
